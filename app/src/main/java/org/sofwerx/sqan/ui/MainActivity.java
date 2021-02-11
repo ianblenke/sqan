@@ -4,7 +4,6 @@ import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
@@ -26,38 +25,37 @@ import android.view.View;
 import android.view.animation.Animation;
 import android.view.animation.AnimationUtils;
 import android.widget.ImageView;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.sofwerx.sqan.Config;
-import org.sofwerx.sqan.ExceptionHelper;
 import org.sofwerx.sqan.LocationService;
 import org.sofwerx.sqan.ManetOps;
 import org.sofwerx.sqan.R;
 import org.sofwerx.sqan.SavedTeammate;
 import org.sofwerx.sqan.SqAnService;
+import org.sofwerx.sqan.listeners.PeripheralStatusListener;
 import org.sofwerx.sqan.listeners.SqAnStatusListener;
 import org.sofwerx.sqan.manet.bt.BtManetV2;
-import org.sofwerx.sqan.manet.bt.Discovery;
+import org.sofwerx.sqan.manet.bt.helper.BTSocket;
 import org.sofwerx.sqan.manet.common.AbstractManet;
 import org.sofwerx.sqan.manet.common.SqAnDevice;
 import org.sofwerx.sqan.manet.common.Status;
 import org.sofwerx.sqan.manet.common.StatusHelper;
 import org.sofwerx.sqan.manet.common.pnt.SpaceTime;
-import org.sofwerx.sqan.util.CommsLog;
+import org.sofwerx.sqan.manet.sdr.SdrManet;
 import org.sofwerx.sqan.util.PermissionsHelper;
 import org.sofwerx.sqan.util.StringUtil;
 import org.sofwerx.sqan.vpn.SqAnVpnService;
 
-import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Timer;
 import java.util.TimerTask;
 
 import static org.sofwerx.sqan.SqAnService.ACTION_STOP;
 
-public class MainActivity extends AppCompatActivity implements SqAnStatusListener {
+public class MainActivity extends AppCompatActivity implements SqAnStatusListener, PeripheralStatusListener {
+    private final static String TAG = Config.TAG+".UI";
     protected static final int REQUEST_DISABLE_BATTERY_OPTIMIZATION = 401;
     private final static long REPORT_PROBLEMS_DURATION = 1000l * 60l;
     private final static long PERIODIC_REFRESH_INTERVAL = 1000l * 5l;
@@ -65,14 +63,16 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
 
     protected boolean serviceBound = false;
     protected SqAnService sqAnService = null;
-    private Switch switchActive;
+    //private Switch switchActive;
     private boolean isSystemChangingSwitchActive = false;
     private TextView textResults;
     private TextView textTxTally, textNetType;
     private TextView textSysStatus;
     private TextView statusMarquee, textOverall;
-    private TextView roleWiFi, roleBT, roleBackhaul, textLocation;
-    private ImageView iconSysStatus, iconSysInfo, iconMainTx, iconPing;
+    private TextView roleWiFi, roleBT, roleSDR, roleSDRstale, roleBackhaul, textLocation;
+    private TextView statusPerphieral;
+    private View statusPeripheralView, statusPeriphProgress;
+    private ImageView iconSysStatus, iconSysInfo, iconMainTx, iconPing, iconPeriphProblem;
     private View offlineStamp;
     private DevicesList devicesList;
     private long lastTxTotal = 0l;
@@ -110,12 +110,12 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        switchActive = findViewById(R.id.mainSwitchActive);
+        //switchActive = findViewById(R.id.mainSwitchActive);
         connectToBackend();
-        if (Config.isAutoStart(this))
+        /*if (Config.isAutoStart(this))
             switchActive.setChecked(true);
         else
-            switchActive.setChecked(false);
+            switchActive.setChecked(false);*/
         textResults = findViewById(R.id.mainTextTemp); //TODO temp
         textTxTally = findViewById(R.id.mainTxBytes);
         textSysStatus = findViewById(R.id.mainTextSysStatus);
@@ -130,8 +130,15 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
         textOverall = findViewById(R.id.mainDescribeOverall);
         roleWiFi = findViewById(R.id.mainRoleWiFi);
         roleBT = findViewById(R.id.mainRoleBT);
+        roleSDR = findViewById(R.id.mainRoleSDR);
+        roleSDRstale = findViewById(R.id.mainRoleSDRstale);
         roleBackhaul = findViewById(R.id.mainBackhaul);
+        statusPeripheralView = findViewById(R.id.mainStatusPeripheral);
+        statusPerphieral = findViewById(R.id.mainStatusPeripheralStatus);
+        statusPeriphProgress = findViewById(R.id.mainStatusPeripheralProgress);
+        iconPeriphProblem = findViewById(R.id.mainStatusPeripheralWarning);
         pingAnimation = AnimationUtils.loadAnimation(getApplicationContext(), R.anim.ping);
+        statusPeripheralView.setOnClickListener(v -> statusPeripheralView.setVisibility(View.GONE));
 
         if (statusMarquee != null) {
             statusMarquee.setOnClickListener(view -> {
@@ -147,7 +154,7 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
             textNetType.setOnClickListener(v ->
                     startActivity(new Intent(MainActivity.this,SettingsActivity.class)));
         }
-        switchActive.setOnCheckedChangeListener((buttonView, isChecked) -> {
+        /*switchActive.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (!isSystemChangingSwitchActive) {
                 Config.setAutoStart(MainActivity.this,isChecked);
                 if (serviceBound && (sqAnService != null) && (sqAnService.getManetOps() != null))
@@ -155,7 +162,7 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
             }
             updateManetTypeDisplay();
             updateActiveIndicator();
-        });
+        });*/
         devicesList = findViewById(R.id.mainDevicesList);
     }
 
@@ -177,35 +184,36 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
         }
     }
 
-    private void updateStatusMarquee() {
-        /*TODO change how this is handled if (statusMarquee != null) {
-            CommsLog.Entry lastError = CommsLog.getLastProblemOrStatus();
-            if ((lastError != null) && ((System.currentTimeMillis() < lastError.time + REPORT_PROBLEMS_DURATION))) {
-                String entry = lastError.toString();
-                if (entry != null) {
-                    if (!marqueeMessages.isEmpty()) {
-                        if (!entry.equalsIgnoreCase(marqueeMessages.get(marqueeMessages.size() - 1)))
-                            marqueeMessages.add(entry);
-                        while (marqueeMessages.size() > 4) {
-                            marqueeMessages.remove(0);
-                        }
-                    } else
-                        marqueeMessages.add(entry);
-                    StringWriter out = new StringWriter();
-                    boolean first = true;
-                    for (String message:marqueeMessages) {
-                        if (first)
-                            first = false;
-                        else
-                            out.append("\r\n");
-                        out.append(message);
-                    }
+    //private long marqueUpdate = Long.MIN_VALUE;
+    private String[] marqueStatuses = new String[10];
+    private void addMarqueStatus(String status) {
+        //marqueUpdate = System.currentTimeMillis();
+        for (int i = 1; i< marqueStatuses.length; i++) {
+            marqueStatuses[i-1]= marqueStatuses[i];
+        }
+        marqueStatuses[marqueStatuses.length-1] = StringUtil.getFormattedJustTime(System.currentTimeMillis())+": "+status;
+        runOnUiThread(() -> updateStatusMarquee());
+    }
 
-                    statusMarquee.setText(out.toString());
-                }
+    private void updateStatusMarquee() {
+        if (marqueStatuses.length < 1) {
+            statusMarquee.setText(null);
+            return;
+        }
+        StringBuilder out = new StringBuilder();
+        boolean first = true;
+        for (int i=marqueStatuses.length-1;i>=0;i--) {
+            if (marqueStatuses[i] != null) {
+                if (first)
+                    first = false;
+                else
+                    out.append("\n");
+                out.append(marqueStatuses[i]);
             }
-            statusMarquee.setSelected(true);
-        }*/
+        }
+
+        statusMarquee.setText(out.toString());
+        statusMarquee.setSelected(true);
         SqAnDevice device = Config.getThisDevice();
         if (device != null) {
             switch (device.getRoleWiFi()) {
@@ -240,12 +248,27 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
 
                 default:
                     roleBT.setVisibility(View.INVISIBLE);
+
             }
+            if (BTSocket.isCongested())
+                roleBT.setTextColor(getColor(R.color.yellow));
+            else
+                roleBT.setTextColor(getColor(R.color.green));
             roleBackhaul.setVisibility(device.isBackhaulConnection()?View.VISIBLE:View.INVISIBLE);
         } else {
             roleWiFi.setVisibility(View.INVISIBLE);
             roleBT.setVisibility(View.INVISIBLE);
             roleBackhaul.setVisibility(View.INVISIBLE);
+        }
+        if ((sqAnService != null) && sqAnService.isSdrManetAvailable()) {
+            if (sqAnService.isSdrManetActive()) {
+                roleSDRstale.setVisibility(View.INVISIBLE);
+                roleSDR.setVisibility(View.VISIBLE);
+            } else
+                roleSDRstale.setVisibility(View.VISIBLE);
+        } else {
+            roleSDR.setVisibility(View.INVISIBLE);
+            roleSDRstale.setVisibility(View.INVISIBLE);
         }
     }
 
@@ -270,6 +293,7 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     public void onResume() {
         super.onResume();
         updateCallsignText();
+        updatePeripheralStatus(null,true,false);
         registerListeners();
         updateManetTypeDisplay();
         if (!permissionsNagFired) {
@@ -295,6 +319,8 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     private void checkForTeammateIssues() {
         if (nagAboutIncompleteSetup && Config.isWarnIncompleteEnabled()) {
             nagAboutIncompleteSetup = false;
+            if ((sqAnService != null) && (sqAnService.isOnlySdr()))
+                return;
 
             //check for missing teammate info
             ArrayList<SavedTeammate> teammates = Config.getSavedTeammates();
@@ -312,13 +338,19 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
                 dialog.setCanceledOnTouchOutside(true);
                 dialog.show();
             } else {
+                boolean checkBt = true;
+                boolean checkWiFi = true;
+                if ((sqAnService != null) && (sqAnService.getManetOps() != null)) {
+                    checkBt = sqAnService.getManetOps().isBtManetSelected();
+                    checkWiFi = sqAnService.getManetOps().isWiFiDirectManetSelected();
+                }
                 int teammatesMissing = 0;
                 int totalTeammates = 0;
                 synchronized (teammates) {
                     for (SavedTeammate teammate:teammates) {
                         if (teammate.isEnabled()) {
                             totalTeammates++;
-                            if (teammate.isIncomplete())
+                            if (teammate.isIncomplete(checkBt,checkWiFi))
                                 teammatesMissing++;
                         }
                     }
@@ -353,7 +385,7 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
             onNodesChanged(null);
             //updateTransmitText();
             //updateSysStatusText();
-            //updateStatusMarquee();
+            updateStatusMarquee();
         });
     }
 
@@ -409,18 +441,16 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
         if (serviceBound && (sqAnService != null) && (sqAnService.getManetOps() != null)) {
             AbstractManet btManet = sqAnService.getManetOps().getBtManet();
             AbstractManet wifiManet = sqAnService.getManetOps().getWifiManet();
-            if (btManet == null) {
-                if (wifiManet != null)
-                    active = wifiManet.isRunning();
-            } else {
-                if (wifiManet == null)
-                    active = btManet.isRunning();
-                else
-                    active = btManet.isRunning() || wifiManet.isRunning();
-            }
+            AbstractManet sdrManet = sqAnService.getManetOps().getSdrManet();
+            if (btManet != null)
+                active = active || btManet.isRunning();
+            if (wifiManet != null)
+                active = active || wifiManet.isRunning();
+            if (sdrManet != null)
+                active = active || sdrManet.isRunning();
         }
         isSystemChangingSwitchActive = true;
-        switchActive.setChecked(active);
+        //switchActive.setChecked(active);
         isSystemChangingSwitchActive = false;
         if (offlineStamp != null)
             offlineStamp.setVisibility(active?View.INVISIBLE:View.VISIBLE);
@@ -447,16 +477,12 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
 
     private void updateManetTypeDisplay() {
         if ((textNetType.getText().toString() == null) || (textNetType.getText().toString().length() < 3)) {
-            if (serviceBound && (sqAnService != null)) {
-                AbstractManet manetWiFi = sqAnService.getManetOps().getWifiManet();
-                if (manetWiFi != null)
-                     textNetType.setText(" Core: "+manetWiFi.getName());
-                else {
-                    AbstractManet manetBt = sqAnService.getManetOps().getBtManet();
-                    if (manetBt != null)
-                        textNetType.setText(" Core: "+manetBt.getName());
-                }
+            int manetType = 0;
+            try {
+                manetType = Integer.parseInt(PreferenceManager.getDefaultSharedPreferences(this).getString(Config.PREFS_MANET_ENGINE,"4"));
+            } catch (NumberFormatException e) {
             }
+            textNetType.setText(" Core: "+getResources().getStringArray(R.array.listManetTypes)[manetType-1]);
         }
     }
 
@@ -484,6 +510,19 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
         if (nagAboutPreferredManet) {
             if ((sqAnService != null) && (sqAnService.getManetOps() != null)) {
                 AbstractManet manet = sqAnService.getManetOps().getBtManet();
+                SdrManet sdrManet = sqAnService.getManetOps().getSdrManet();
+                if (sdrManet != null) {
+                    final String issues = sdrManet.getSystemIssues();
+                    if (issues != null) {
+                        new AlertDialog.Builder(this)
+                                .setTitle("SDR Configuration")
+                                .setMessage("Your SDR Configuration is not recommended. "+issues)
+                                .setPositiveButton("Change", (dialog, which) -> {
+                                    startActivity(new Intent(this, SettingsActivity.class));
+                                })
+                                .setNegativeButton("Ignore", (dialog, which) -> dialog.cancel()).create().show();
+                    }
+                }
                 if ((manet == null) || (manet instanceof BtManetV2)) {
                     //ignore as this is the recommended option
                 } else {
@@ -517,6 +556,7 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
             sqAnService = binder.getService();
             serviceBound = true;
             registerListeners();
+            addMarqueStatus("Status is: "+StatusHelper.getName(sqAnService.getStatus()));
             updateManetTypeDisplay();
             updateSysStatusText();
             updateActiveIndicator();
@@ -566,13 +606,20 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     }
 
     private void unregisterListeners() {
-        if (serviceBound && (sqAnService != null))
+        Log.d(Config.TAG,"MainActivity.unregisterListeners()");
+        if (serviceBound && (sqAnService != null)) {
             sqAnService.setListener(null);
+            sqAnService.setPeripheralStatusListener(null);
+        }
     }
 
     private void registerListeners() {
-        if (serviceBound && (sqAnService != null))
+        if (serviceBound && (sqAnService != null)) {
+            Log.d(Config.TAG,"MainActivity.registerListeners()");
             sqAnService.setListener(this);
+            sqAnService.setPeripheralStatusListener(this);
+        } else
+            Log.d(Config.TAG,"MainActivity.registerListeners() ignored (not bound)");
     }
 
     private void checkForLocationServices() {
@@ -692,12 +739,14 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     @Override
     public void onStatus(final Status status) {
         runOnUiThread(() -> {
-            textResults.setText("Status is: "+StatusHelper.getName(status));
+            String statusString = "Status is: "+StatusHelper.getName(status);
+            textResults.setText(statusString);
+            addMarqueStatus(statusString);
             updateManetTypeDisplay();
             updateActiveIndicator();
             updateMainStatus(status);
-            updateOverallMeshHealth();
             updateStatusMarquee();
+            onNodesChanged(null);
         });
     }
 
@@ -705,7 +754,10 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
     public void onNodesChanged(SqAnDevice device) {
         runOnUiThread(() -> {
             devicesList.update(device);
-            updateStatusMarquee();
+            //if (device != null) {
+            //    addMarqueStatus(device.getLabel()+" status "+device.getStatus().name());
+            //    updateStatusMarquee();
+            //}
             updateOverallMeshHealth();
         });
     }
@@ -717,12 +769,60 @@ public class MainActivity extends AppCompatActivity implements SqAnStatusListene
 
     @Override
     public void onSystemReady(boolean isReady) {
-        runOnUiThread(() -> updateSysStatusText());
+        runOnUiThread(() -> {
+            addMarqueStatus("System is ready");
+            updateSysStatusText();
+            updateStatusMarquee();
+        });
     }
 
     @Override
     public void onConflict(SqAnDevice conflictingDevice) {
         //FIXME do something other than toast this
         Toast.makeText(this,"Error: this device has the same identifier as "+conflictingDevice.getCallsign(),Toast.LENGTH_LONG).show();
+    }
+
+    @Override
+    public void onHighNoise(final float snr) {
+        Log.d(TAG,"onHighNoise()");
+        runOnUiThread(() -> updatePeripheralStatus("SqAN is receiving large amounts of corrupted data (SNR = "+String.format("%.02f", snr)+"). Check connections and RF environment.",false,true));
+    }
+
+    @Override
+    public void onPeripheralMessage(String message) {
+        updatePeripheralStatus(message,false,false);
+    }
+
+    @Override
+    public void onPeripheralReady() {
+        Log.d(Config.TAG,"onPeripheralReady()");
+        updatePeripheralStatus(null,true, false);
+    }
+
+    @Override
+    public void onPeripheralError(String message) {
+        updatePeripheralStatus(message,false, true);
+    }
+
+    private void updatePeripheralStatus(final String message, final boolean ready, final boolean isError) {
+        this.runOnUiThread(() -> {
+            if (ready) {
+                statusPeripheralView.setVisibility(View.GONE);
+                addMarqueStatus("Connected device is operational");
+            } else {
+                if (message != null) {
+                    statusPerphieral.setText(message);
+                    addMarqueStatus(message);
+                    if (isError) {
+                        iconPeriphProblem.setVisibility(View.VISIBLE);
+                        statusPeriphProgress.setVisibility(View.GONE);
+                    } else {
+                        iconPeriphProblem.setVisibility(View.GONE);
+                        statusPeriphProgress.setVisibility(View.VISIBLE);
+                    }
+                }
+                statusPeripheralView.setVisibility(View.VISIBLE);
+            }
+        });
     }
 }

@@ -21,6 +21,7 @@ import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.Log;
 
+import org.sofwerx.sqan.listeners.PeripheralStatusListener;
 import org.sofwerx.sqan.listeners.SqAnStatusListener;
 import org.sofwerx.sqan.manet.common.SqAnDevice;
 import org.sofwerx.sqan.manet.common.Status;
@@ -32,34 +33,35 @@ import org.sofwerx.sqan.manet.common.packet.AbstractPacket;
 import org.sofwerx.sqan.manet.common.packet.HeartbeatPacket;
 import org.sofwerx.sqan.manet.common.packet.VpnPacket;
 import org.sofwerx.sqan.manet.common.pnt.SpaceTime;
+import org.sofwerx.sqan.manet.common.sockets.TransportPreference;
 import org.sofwerx.sqan.receivers.BootReceiver;
 import org.sofwerx.sqan.receivers.ConnectivityReceiver;
 import org.sofwerx.sqan.receivers.PowerReceiver;
 import org.sofwerx.sqan.util.CommsLog;
 import org.sofwerx.sqan.util.NetUtil;
 import org.sofwerx.sqan.vpn.SqAnVpnService;
+import org.sofwerx.sqandr.util.ContinuityGapSAR;
 
 import java.io.StringWriter;
 import java.util.ArrayList;
-import java.util.Random;
 
 /**
  * SqAnService is the main service that keeps SqAN running and coordinates all other actions
  */
 public class SqAnService extends Service implements LocationService.LocationUpdateListener {
     public static final int REQUEST_ENABLE_VPN = 421;
+    private final static long CLEANUP_DELAY = 1000l * 1l; //time to wait before completing shutdown
     private final static long MAX_INTERVAL_BETWEEN_COMMS = 1000l * 7l;
     private final static long INTERVAL_BETWEEN_DEVICES_CLEANUP = 1000l * 15l;
     private final static long INTERVAL_BETWEEN_HEALTH_CHECK = 1000l * 60l;
-    private final static long MIN_TIME_BETWEEN_HEARTBEATS = 1000l * 2l;
-    private final static long MAX_TIME_BETWEEN_HEARTBEATS = 1000l * 50l;
+    private final static long MIN_TIME_BETWEEN_HEARTBEATS = 1000l * 1l;
+    private final static long MAX_TIME_BETWEEN_HEARTBEATS = 1000l * 7l;
     public final static String ACTION_STOP = "STOP";
     public final static String EXTRA_KEEP_ACTIVITY = "keepActivity";
     private final static int SQAN_NOTIFICATION_ID = 60;
     private final static int SQAN_NOTIFICATION_VPN_ACTIVITY_BUT_NOT_ON = 71;
     private final static long HELPER_INTERVAL = 1000l * 5l;
     private final static String NOTIFICATION_CHANNEL = "sqan_notify";
-    private Random random = new Random();
 
     private PowerManager.WakeLock wakeLock;
     private PowerManager powerManager;
@@ -73,7 +75,7 @@ public class SqAnService extends Service implements LocationService.LocationUpda
     protected SqAnStatusListener listener = null;
     private NotificationChannel channel = null;
     private ManetOps manetOps;
-    private Status lastNotifiedStatus = Status.ERROR; //the last status provided in a notification (used to prevent the notifications from firing multiple times when there is no meaningful status change)
+    private Status lastNotifiedStatus = Status.OFF; //the last status provided in a notification (used to prevent the notifications from firing multiple times when there is no meaningful status change)
     private int numDevicesInLastNotification = 0;
     private long lastPositiveOutgoingComms = Long.MIN_VALUE;
     private int lastHeartbeatLevel = 0;
@@ -84,6 +86,8 @@ public class SqAnService extends Service implements LocationService.LocationUpda
     private LocationService locationService;
     private SqAnVpnService vpnService;
     private int missedVpnPacketCount = 0;
+    private long nextNoiseNotificationWindow = Long.MIN_VALUE;
+    private final static long TIME_BETWEEN_NOISE_NOTIFICATIONS = 1000l * 60l * 5l;
 
     private static ArrayList<AbstractManetIssue> issues = null; //issues currently blocking or degrading the MANET
 
@@ -104,7 +108,35 @@ public class SqAnService extends Service implements LocationService.LocationUpda
 
     public static SqAnService getInstance() { return thisService; }
 
-    //FIXME build an intent receiver to send/receive ChannelBytePackets as a way to use SqAN over IPC
+    public boolean isWiFiManetAvailable() {
+        if (manetOps == null)
+            return false;
+        return manetOps.isWiFiManetAvailable();
+    }
+
+    public boolean isBtManetAvailable() {
+        if (manetOps == null)
+            return false;
+        return manetOps.isBtManetAvailable();
+    }
+
+    public boolean isSdrManetAvailable() {
+        if (manetOps == null)
+            return false;
+        return manetOps.isSdrManetAvailable();
+    }
+
+    public boolean isSdrManetActive() {
+        if (manetOps == null)
+            return false;
+        return manetOps.isSdrManetActive();
+    }
+
+    public static void burstVia(AbstractPacket packet, TransportPreference transportPreference) {
+        if ((thisService == null) || (packet == null) || (thisService.manetOps == null) || (transportPreference == null))
+            return;
+        thisService.burst(packet,transportPreference);
+    }
 
     @Override
     public void onCreate() {
@@ -154,7 +186,7 @@ public class SqAnService extends Service implements LocationService.LocationUpda
             requestHeartbeat();
             if (System.currentTimeMillis() > nextDevicesCleanup) {
                 nextDevicesCleanup = System.currentTimeMillis() + INTERVAL_BETWEEN_DEVICES_CLEANUP;
-                SqAnDevice mergedDevice = SqAnDevice.dedup();
+                SqAnDevice.dedup();
                 checkForStaleDevices();
             }
             if (System.currentTimeMillis() > nextHealthCheck)
@@ -296,16 +328,27 @@ public class SqAnService extends Service implements LocationService.LocationUpda
             onIssueDetected(new SqAnAppIssue(true,"ManetOps is null"));
             systemReady = false;
         } else {
-            if ((manetOps.getWifiManet() == null) && (manetOps.getBtManet() == null)) {
+            if ((manetOps.getWifiManet() == null) && (manetOps.getBtManet() == null) && (manetOps.getSdrManet() == null)) {
                 onIssueDetected(new SqAnAppIssue(true, "No MANET selected"));
                 systemReady = false;
             } else {
-                if (manetOps.getBtManet() == null)
-                    systemReady = manetOps.getWifiManet().checkForSystemIssues();
-                else if (manetOps.getWifiManet() == null)
-                    systemReady = manetOps.getBtManet().checkForSystemIssues();
+                boolean issuesBt;
+                if (manetOps.getBtManet() != null)
+                    issuesBt = !manetOps.getBtManet().checkForSystemIssues();
                 else
-                    systemReady = manetOps.getBtManet().checkForSystemIssues() && manetOps.getWifiManet().checkForSystemIssues();
+                    issuesBt = false;
+                boolean issuesWiFi;
+                if (manetOps.getWifiManet() != null)
+                    issuesWiFi = !manetOps.getWifiManet().checkForSystemIssues();
+                else
+                    issuesWiFi = false;
+                boolean issuesSDR;
+                if (manetOps.getSdrManet() != null)
+                    issuesSDR = !manetOps.getSdrManet().checkForSystemIssues();
+                else
+                    issuesSDR = false;
+
+                systemReady = !issuesBt && !issuesWiFi && !issuesSDR;
             }
         }
 
@@ -317,21 +360,25 @@ public class SqAnService extends Service implements LocationService.LocationUpda
         return systemReady;
     }
 
+    public boolean burst(final AbstractPacket packet) {
+        return burst(packet, TransportPreference.AGNOSTIC);
+    }
+
     /**
      * Sends a packet over the MANET
      * @param packet packet to send
      * @return true == attempting to send; false = unable to send (MANET not ready)
      */
-    public boolean burst(final AbstractPacket packet) {
-        if ((packet == null) || !StatusHelper.isActive(manetOps.getStatus())) {
+    public boolean burst(final AbstractPacket packet, final TransportPreference preferredTransport) {
+        if ((packet == null) || (manetOps == null) || !StatusHelper.isActive(manetOps.getStatus())) {
             Log.d(Config.TAG, "Unable to burst packet: " + ((packet == null) ? "null packet" : "MANET is not active"));
             return false;
         }
         if (handler == null) {
             CommsLog.log(CommsLog.Entry.Category.PROBLEM,"SqAnService handler is not ready yet; sending burst directly to ManetOps");
-            manetOps.burst(packet);
+            manetOps.burst(packet,preferredTransport);
         } else
-            handler.post(() -> manetOps.burst(packet));
+            handler.post(() -> manetOps.burst(packet,preferredTransport));
         return true;
     }
 
@@ -401,49 +448,38 @@ public class SqAnService extends Service implements LocationService.LocationUpda
     }
 
     public static void shutdown(boolean keepActivity) {
-        if (thisService != null)
+        if (thisService != null) {
             thisService.requestShutdown(keepActivity);
+            thisService = null;
+        }
     }
 
     public void requestShutdown(boolean keepActivity) {
-        releaseWakeLock();
         if (!keepActivity && (listener != null) && (listener instanceof Activity)) {
             try {
                 ((Activity)listener).finish();
             } catch (Exception e) {
             }
         }
-        SqAnVpnService.stop(this);
-        CommsLog.clear();
-        Config.savePrefs(this);
-        if (handler == null) {
+        if (handler == null)
             shutdown();
-            SqAnDevice.clearAllDevices(null);
-            stopSelf();
-        } else {
+        else {
             handler.post(() -> {
                 shutdown();
-                SqAnDevice.clearAllDevices(null);
-                stopSelf();
             });
         }
     }
 
     private void shutdown() {
         CommsLog.log(CommsLog.Entry.Category.STATUS,"SqAnService shutdown initiated");
-        manetOps.shutdown();
-        try {
-            stopForeground(true);
-        } catch (Exception ignore) {
-        }
-        NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (notificationManager != null) {
-            notificationManager.cancelAll();
-        }
-        if (handler != null) {
-            Log.d(Config.TAG,"SqAnService removing periodicHelper callback");
-            handler.removeCallbacks(periodicHelper);
-            handler = null;
+        releaseWakeLock();
+        SqAnVpnService.stop(this);
+        vpnService = null;
+        CommsLog.clear();
+        Config.savePrefs(this);
+        if (manetOps != null) {
+            manetOps.shutdown();
+            manetOps = null;
         }
         if (alarmManager != null) {
             /*if (pendingIntentCommsRetry != null) {
@@ -471,7 +507,32 @@ public class SqAnService extends Service implements LocationService.LocationUpda
             device.setRoleWiFi(SqAnDevice.NodeRole.OFF);
             device.setRoleBT(SqAnDevice.NodeRole.OFF);
         }
+        if (handler != null) {
+            handler.removeCallbacks(periodicHelper);
+            Log.d(Config.TAG,"SqAnService removing periodicHelper callback");
+            handler.postDelayed(() -> {
+                clearServiceAndNotifications();
+                handler = null;
+            },CLEANUP_DELAY); //let the MANET clean-up before completing shutdown
+        } else
+            clearServiceAndNotifications();
+        SqAnService.thisService = null;
+    }
+
+    private void clearServiceAndNotifications() {
+        Log.d(Config.TAG,"Clearing notifications and foreground service");
+        try {
+            stopForeground(true);
+        } catch (Exception ignore) {
+        }
+        NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (notificationManager != null) {
+            notificationManager.cancelAll();
+        }
         thisService = null;
+        SqAnDevice.clearAllDevices(null);
+        Log.d(Config.TAG,"Shutdown complete. Stopping....");
+        stopSelf();
     }
 
     public void onStatusChange(final Status status, final String error) {
@@ -578,8 +639,12 @@ public class SqAnService extends Service implements LocationService.LocationUpda
         if (StatusHelper.isNotificationWarranted(lastNotifiedStatus, status)) {
             lastNotifiedStatus = status;
             notifyStatusChange(message);
+            if (listener != null)
+                listener.onStatus(status);
         }
     }
+
+    public Status getStatus() { return lastNotifiedStatus; }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -622,6 +687,27 @@ public class SqAnService extends Service implements LocationService.LocationUpda
         vpnService = sqAnVpnService;
     }
 
+    /**
+     * Does this MANET only use SDRs
+     * @return
+     */
+    public boolean isOnlySdr() {
+        if (manetOps != null) {
+            if (manetOps.isSdrManetSelected())
+                return !manetOps.isBtManetSelected() && !manetOps.isWiFiDirectManetSelected() && !manetOps.isWiFiAwareManetSelected();
+        }
+        return false;
+    }
+
+    public void handleHighNoise(float snr) {
+        if (System.currentTimeMillis() > nextNoiseNotificationWindow) {
+            nextNoiseNotificationWindow = System.currentTimeMillis() + TIME_BETWEEN_NOISE_NOTIFICATIONS;
+            if (listener != null)
+                listener.onHighNoise(snr);
+            notifyStatusChange("SqAN is receiving an unusually large amount of corrupted data. Check connections and RF environment.");
+        }
+    }
+
     public class SqAnServiceBinder extends Binder {
         public SqAnService getService() {
             return SqAnService.this;
@@ -629,4 +715,9 @@ public class SqAnService extends Service implements LocationService.LocationUpda
     }
 
     public ManetOps getManetOps() { return manetOps; }
+
+    public void setPeripheralStatusListener(PeripheralStatusListener listener) {
+        if (manetOps != null)
+            manetOps.setPeripheralStatusListener(listener);
+    }
 }

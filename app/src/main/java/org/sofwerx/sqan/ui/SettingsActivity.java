@@ -2,6 +2,7 @@ package org.sofwerx.sqan.ui;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.DialogInterface;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.preference.Preference;
@@ -57,13 +58,32 @@ public class SettingsActivity extends Activity {
             builder.setTitle(R.string.shutdown_required);
             builder.setMessage(R.string.prefs_manet_changed_description);
             final AlertDialog dialog = builder.create();
+            /*dialog.setButton(DialogInterface.BUTTON_POSITIVE, "Shutdown", (dialog1, which) -> {
+                finish();
+                if (SqAnService.getInstance() != null)
+                    SqAnService.getInstance().requestShutdown(false);
+            });*/
+            dialog.show();
+        } else if (Config.PREFS_VPN_FORWARD.equalsIgnoreCase(key)) {
+            Config.recheckPreferences(this);
+        } else if (Config.PREFS_SDR_LISTEN_ONLY.equalsIgnoreCase(key)) {
+            Config.recheckPreferences(this);
+        } else if (Config.PREFS_VPN_AUTO_ADD.equalsIgnoreCase(key)) {
+            Config.recheckPreferences(this);
+        } else if (Config.PREFS_VPN_MTU.equalsIgnoreCase(key)) {
+            Config.recheckPreferences(this);
+            AlertDialog.Builder builder = new AlertDialog.Builder(SettingsActivity.this);
+            builder.setTitle(R.string.shutdown_required);
+            builder.setMessage(R.string.prefs_vpn_changed_description);
+            final AlertDialog dialog = builder.create();
             dialog.show();
         } else if (Config.PREFS_VPN_MODE.equalsIgnoreCase(key)) {
             if (Config.isVpnEnabled())
                 SqAnVpnService.start(SqAnService.getInstance());
             else
                 SqAnVpnService.stop(SqAnService.getInstance());
-        } else if (Config.PREFS_WRITE_LOG.equalsIgnoreCase(key)) {
+        } else if (Config.PREFS_WRITE_LOG.equalsIgnoreCase(key)
+                || (Config.PREFS_IGNORE_0_0_0_0.equalsIgnoreCase(key))) {
             Config.recheckPreferences(this);
             CommsLog.init(this);
         }

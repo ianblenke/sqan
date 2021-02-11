@@ -15,26 +15,27 @@ import org.sofwerx.sqan.Config;
 import org.sofwerx.sqan.R;
 import org.sofwerx.sqan.manet.common.SqAnDevice;
 import org.sofwerx.sqan.util.CommsLog;
+import org.sofwerx.sqan.util.NetUtil;
 import org.sofwerx.sqan.util.StringUtil;
 
 import java.io.StringWriter;
 
 public class DeviceSummary extends ConstraintLayout {
     private final static long TIME_TO_SHOW_FORWARDING = 1000l * 15l; //how long after a forward operation should the forwarding icon be visible
-    private TextView callsign, uuid, description;
+    private TextView callsign, uuid, ipv4, description;
     private TextView hops, links;
-    private ImageView iconConnectivity;
+    //private ImageView iconConnectivity;
     private ImageView iconPower;
     private ImageView iconLink;
     private ImageView iconLoc;
     private ImageView iconType;
     private View markerBackhaul;
+    private TextView markerWiFiAware;
     private ImageView iconPing,iconForward;
     private TextView textDistance,textDistanceAccuracy;
     private boolean unavailable = false;
     private boolean significant = false;
     private Animation pingAnimation;
-    private long lastData = 0;
 
     public DeviceSummary(@NonNull Context context) {
         super(context);
@@ -55,13 +56,15 @@ public class DeviceSummary extends ConstraintLayout {
         View view = inflate(context,R.layout.device_summary,this);
         callsign = view.findViewById(R.id.deviceCallsign);
         uuid = view.findViewById(R.id.deviceUUID);
+        ipv4 = view.findViewById(R.id.deviceIP);
         description = view.findViewById(R.id.deviceDetails);
-        iconConnectivity = view.findViewById(R.id.deviceConnectivity);
+        //iconConnectivity = view.findViewById(R.id.deviceConnectivity);
         iconPower = view.findViewById(R.id.deviceBattery);
         iconLink = view.findViewById(R.id.deviceLink);
         iconLoc = view.findViewById(R.id.deviceLocation);
         iconType = view.findViewById(R.id.deviceTypeIcon);
         markerBackhaul = view.findViewById(R.id.deviceBackhaul);
+        markerWiFiAware = view.findViewById(R.id.deviceWiFiAware);
         textDistance = view.findViewById(R.id.deviceDistance);
         textDistanceAccuracy = view.findViewById(R.id.deviceDistanceAccuracy);
         iconPing = view.findViewById(R.id.devicePing);
@@ -79,28 +82,28 @@ public class DeviceSummary extends ConstraintLayout {
     public void update(SqAnDevice device) {
         if (device != null) {
             device.setUiSummary(this);
-            StringWriter out = new StringWriter();
-            out.append("(SqAN UUID: ");
-            if (device.isUuidKnown())
-                out.append(Integer.toString(device.getUUID()));
-            else
-                out.append("unknown");
-            /*if (device.getNetworkId() != null) {
-                out.append(", net ID: ");
-                out.append(device.getNetworkId());
-            }*/
-            out.append(')');
+            if (device.isUuidKnown()) {
+                uuid.setText("SqAN UUID: " + device.getUUID());
+                ipv4.setText("SqAN IP: " + device.getVpnIpv4AddressString());
+            } else {
+                uuid.setText(device.getLabel());
+                ipv4.setText("Unknown SqAN IP");
+            }
             callsign.setText(device.getCallsign());
-            uuid.setText(out.toString());
             StringWriter descOut = new StringWriter();
             descOut.append("Rx: ");
-            long currentTally = device.getDataTally();
-            if (lastData != currentTally) {
-                lastData = currentTally;
+            if (device.isDataTallyGuiNeedUpdate()) {
+                device.markDataTallyDisplayed();
                 if (device.isActive())
                     showPing();
             }
-            descOut.append(StringUtil.toDataSize(lastData));
+            descOut.append(StringUtil.toDataSize(device.getDataTally()));
+            long elapsedTime = (System.currentTimeMillis() - device.getFirstConnection())/1000l;
+            if (elapsedTime > 60l) {
+                descOut.append(" (");
+                descOut.append(StringUtil.getDataRate(device.getDataTally(),elapsedTime));
+                descOut.append(')');
+            }
             long lastLatency = device.getLastLatency();
             if (lastLatency > 0l) {
                 descOut.append("; latency ");
@@ -108,6 +111,11 @@ public class DeviceSummary extends ConstraintLayout {
                 descOut.append("ms (avg ");
                 descOut.append(Long.toString(device.getAverageLatency()));
                 descOut.append("ms)");
+            }
+            if (device.getPacketsDropped() > 0) {
+                descOut.append("; ");
+                descOut.append(Integer.toString(device.getPacketsDropped()));
+                descOut.append((device.getPacketsDropped()==1)?" pkt drop":" pkts drop");
             }
             CommsLog.Entry lastEntry = device.getLastEntry();
             if (lastEntry != null) {
@@ -119,7 +127,6 @@ public class DeviceSummary extends ConstraintLayout {
             updateLinkDisplay(device);
             if (iconType != null)
                 iconType.setVisibility(VISIBLE);
-            markerBackhaul.setVisibility(device.isBackhaulConnection()?View.VISIBLE:View.INVISIBLE);
             if (device.getStatus() == SqAnDevice.Status.CONNECTED) {
                 int numHops = device.getHopsAway();
                 if (numHops < 0)
@@ -147,8 +154,9 @@ public class DeviceSummary extends ConstraintLayout {
             callsign.setText("No sensor");
             description.setVisibility(View.INVISIBLE);
             uuid.setVisibility(View.INVISIBLE);
+            ipv4.setVisibility(View.INVISIBLE);
             iconPower.setVisibility(View.INVISIBLE);
-            iconConnectivity.setVisibility(View.INVISIBLE);
+            //iconConnectivity.setVisibility(View.INVISIBLE);
             markerBackhaul.setVisibility(View.INVISIBLE);
             hops.setVisibility(View.INVISIBLE);
             links.setVisibility(View.INVISIBLE);
@@ -197,6 +205,7 @@ public class DeviceSummary extends ConstraintLayout {
             callsign.setTextColor(getContext().getResources().getColor(R.color.light_grey));
             description.setTextColor(getContext().getResources().getColor(R.color.light_grey));
             uuid.setTextColor(getContext().getResources().getColor(R.color.light_grey));
+            ipv4.setTextColor(getContext().getResources().getColor(R.color.light_grey));
             if (iconType != null)
                 iconType.setColorFilter(getResources().getColor(R.color.light_grey));
             if (iconLoc != null)
@@ -208,10 +217,22 @@ public class DeviceSummary extends ConstraintLayout {
             hops.setVisibility(View.INVISIBLE);
             links.setVisibility(View.INVISIBLE);
             iconForward.setVisibility(View.INVISIBLE);
+            markerBackhaul.setVisibility(View.INVISIBLE);
+            markerWiFiAware.setVisibility(View.INVISIBLE);
         } else {
             callsign.setTextColor(getContext().getResources().getColor(R.color.yellow));
             uuid.setTextColor(getContext().getResources().getColor(R.color.white));
+            ipv4.setTextColor(getContext().getResources().getColor(R.color.white));
             description.setTextColor(getContext().getResources().getColor(significant ? R.color.yellow : R.color.white_hint_green));
+            markerBackhaul.setVisibility(device.isBackhaulConnection()?View.VISIBLE:View.INVISIBLE);
+            if ((device.getAwareMac()!=null)&&device.getAwareMac().isValid()) {
+                if (device.isDirectWiFiHighPerformance())
+                    markerWiFiAware.setTextColor(getResources().getColor(R.color.green));
+                else
+                    markerWiFiAware.setTextColor(getResources().getColor(R.color.yellow));
+                markerWiFiAware.setVisibility(View.VISIBLE);
+            } else
+                markerWiFiAware.setVisibility(View.INVISIBLE);
             if (iconType != null)
                 iconType.setColorFilter(getResources().getColor(R.color.white_hint_green));
             if (iconLoc != null) {

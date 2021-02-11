@@ -2,32 +2,44 @@ package org.sofwerx.sqan.manet.common;
 
 import android.bluetooth.BluetoothAdapter;
 import android.util.Log;
-import android.util.TimeUtils;
 
 import org.sofwerx.sqan.Config;
 import org.sofwerx.sqan.SavedTeammate;
 import org.sofwerx.sqan.ipc.BftDevice;
+import org.sofwerx.sqan.manet.common.issues.AbstractCommsIssue;
+import org.sofwerx.sqan.manet.common.issues.PacketDropIssue;
+import org.sofwerx.sqan.manet.common.issues.WiFiConnectivityIssue;
+import org.sofwerx.sqan.manet.common.issues.WiFiIssue;
 import org.sofwerx.sqan.manet.common.packet.PacketHeader;
+import org.sofwerx.sqan.manet.common.packet.VpnPacket;
 import org.sofwerx.sqan.manet.common.pnt.NetworkTime;
 import org.sofwerx.sqan.manet.common.pnt.SpaceTime;
 import org.sofwerx.sqan.manet.common.sockets.TransportPreference;
 import org.sofwerx.sqan.util.AddressUtil;
 import org.sofwerx.sqan.ui.DeviceSummary;
 import org.sofwerx.sqan.util.CommsLog;
+import org.sofwerx.sqan.util.NetUtil;
 import org.sofwerx.sqan.util.StringUtil;
+import org.sofwerx.sqan.util.UuidUtil;
 
+import java.net.Inet6Address;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class SqAnDevice {
+    private final static int FIRST_VALID_UUID = 1540000000; //no SqAN device should have a UUID below this
+    //private final static int VALID_UUID_UPPER_BOUNDS = (int)(System.currentTimeMillis()/1000l)+2000000;
+    private final static int VALID_UUID_UPPER_BOUNDS = (int)(System.currentTimeMillis()/1000l)+80000000;
     private static final long TIME_TO_CONSIDER_HOP_COUNT_STALE = 1000l * 60l;
     public final static long TIME_TO_STALE = 1000l * 60l;
-    private final static long TIME_TO_REMOVE_STALE = TIME_TO_STALE * 2l;
+    //private final static long TIME_TO_REMOVE_STALE = TIME_TO_STALE * 2l;
     private final static int MAX_LATENCY_HISTORY = 100; //the max number of latency records to keep
     public final static int UNASSIGNED_UUID = Integer.MIN_VALUE;
     public final static int BROADCAST_IP = AddressUtil.getSqAnVpnIpv4Address(PacketHeader.BROADCAST_ADDRESS);
     private final static int MAX_RELAY_CONNECTIONS_TO_SAVE = 20;
+    public final static byte[] NO_IPV6_ADDRESS = {(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0,(byte)0};
     private static AtomicInteger nextUnassignedUUID = new AtomicInteger(-1);
     private static ArrayList<SqAnDevice> devices;
     private int uuid; //this is the persistent SqAN ID for this device
@@ -35,8 +47,10 @@ public class SqAnDevice {
     private String uuidExtended; //this is the persistent ID for this device used solely to look for conflicts
     private MacAddress bluetoothMac;
     private String networkId; //this is the transient MANET ID for this device
+    private int transientAwareId = UNASSIGNED_UUID;
     private long lastConnect = Long.MIN_VALUE;
     private long rxDataTally = 0l; //talley of received bytes from this node
+    private long displayedRxTally = 0l; //a counter used to help update the GUI when a "ping" happens
     private Status status = Status.OFFLINE;
     private ArrayList<Long> latencies;
     private long discoveryTime = -1l; //used to mark when this device was discovered
@@ -47,15 +61,115 @@ public class SqAnDevice {
     private DeviceSummary uiSummary = null;
     private NodeRole roleWiFi = NodeRole.OFF;
     private NodeRole roleBT = NodeRole.OFF;
+    private NodeRole roleSDR = NodeRole.OFF;
     private int hopsAway = 0;
     private boolean directBt = false;
     private boolean directWiFi = false;
+    private boolean directWiFiHiPerf = false; //is high performance WiFi connected
+    private boolean directSDR = false;
     private long lastHopUpdate = Long.MIN_VALUE;
     private long lastForwardedToThisDevice = Long.MIN_VALUE;
     private ArrayList<RelayConnection> relays = new ArrayList<>();
     private int ipV4Address = Integer.MIN_VALUE;
     private TransportPreference preferredTransport = TransportPreference.AGNOSTIC;
     private long connectionStart = Long.MIN_VALUE;
+    private final static int MAX_ISSUES_LOG = 20;
+    private ArrayList<AbstractCommsIssue> issues;
+    private int packetsDropped = 0;
+    private MacAddress directMac;
+    private MacAddress awareMac;
+    private Inet6Address awareServerIp;
+    private ArrayList<VpnForwardValue> forwarding;
+
+    public static boolean isValidUuid(int origin) {
+        return (origin > FIRST_VALID_UUID) && (origin < VALID_UUID_UPPER_BOUNDS);
+    }
+    //private boolean awareServer = false;
+    //private Inet6Address ipv6 = null;
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("Callsign: ");
+        if (callsign == null)
+            sb.append("NONE");
+        else
+            sb.append(callsign);
+        if (status != null) {
+            sb.append(", ");
+            sb.append(status.name());
+        }
+        sb.append(", BT MAC: ");
+        if ((bluetoothMac == null) || !bluetoothMac.isValid())
+            sb.append("unknown");
+        else
+            sb.append(bluetoothMac.toString());
+        if ((networkId != null) && (networkId.length() > 0)) {
+            sb.append(", transient WiFI ID ");
+            sb.append(networkId);
+        }
+        if (transientAwareId != UNASSIGNED_UUID) {
+            sb.append(", AWARE ID ");
+            sb.append(Integer.toString(transientAwareId));
+        }
+        if (lastConnect > 0l)
+            sb.append(", last comms "+StringUtil.toDuration(System.currentTimeMillis() - lastConnect)+" ago");
+        if (backhaulConnection)
+            sb.append(", is backhaul connection");
+        if ((roleWiFi != null) && (roleWiFi != NodeRole.OFF)) {
+            sb.append(", WiFi role ");
+            sb.append(roleWiFi.name());
+        }
+        if ((roleBT != null) && (roleBT != NodeRole.OFF)) {
+            sb.append(", BT role ");
+            sb.append(roleBT.name());
+        }
+        if (hopsAway == 0)
+            sb.append(", directly connected");
+        else
+            sb.append(", "+hopsAway+" hop"+((hopsAway==1)?"":"s")+" away");
+        sb.append(", preferred transport: ");
+        sb.append(preferredTransport.name());
+        if (directWiFiHiPerf)
+            sb.append(", requires high performance WiFi");
+        sb.append(", ");
+        sb.append(StringUtil.toDataSize(rxDataTally)+" received");
+        if (connectionStart > 0l) {
+            sb.append(" since connecting ");
+            sb.append(StringUtil.toDuration(System.currentTimeMillis() - connectionStart));
+            sb.append(" ago");
+        }
+        if (lastLocation != null) {
+            sb.append(", location (");
+            sb.append(lastLocation.toString());
+            sb.append(")");
+        }
+        if ((relays != null) && !relays.isEmpty()) {
+            sb.append(", connected to [");
+            boolean first = true;
+            for (RelayConnection relay:relays) {
+                if (first)
+                    first = false;
+                else
+                    sb.append(", ");
+                sb.append(relay.toString());
+            }
+            sb.append("]");
+        }
+        if (packetsDropped > 0)
+            sb.append(packetsDropped+" packet"+((packetsDropped==1)?"":"s")+" dropped");
+        if ((awareMac != null) && awareMac.isValid())
+            sb.append(", AWARE MAC "+awareMac.toString());
+        if (awareServerIp != null)
+            sb.append(", AWARE IP "+awareServerIp.getHostAddress());
+        if ((issues != null) && (issues.size() > 0)) {
+            sb.append(", ");
+            sb.append(issues.get(issues.size()-1).toString());
+        }
+
+        return sb.toString();
+    }
 
     /**
      * SqAnDevice
@@ -64,6 +178,8 @@ public class SqAnDevice {
     public SqAnDevice(int uuid) {
         init(uuid);
     }
+
+    public long getFirstConnection() { return connectionStart; }
 
     /**
      * Constructor that creates a placeholder UUID that is later intended to be updated
@@ -91,6 +207,37 @@ public class SqAnDevice {
             bluetoothMac = teammate.getBluetoothMac();
         }
     }
+
+    /**
+     * Finds the device that matches this WiFi Aware ID
+     * @param id
+     * @return null == not found
+     */
+    public static SqAnDevice findByTransientAwareID(int id) {
+        if ((id != UNASSIGNED_UUID) && (devices != null) && !devices.isEmpty()) {
+            synchronized (devices) {
+                for (SqAnDevice device:devices) {
+                    if ((device != null) && (device.transientAwareId == id))
+                        return device;
+                }
+            }
+        }
+        return null;
+    }
+
+    /*public Inet6Address getIpv6() { return ipv6; }
+
+    public static SqAnDevice findByTransientAwareIPV6(Inet6Address ipv6) {
+        if ((ipv6 != null) && (devices != null) && !devices.isEmpty()) {
+            synchronized (devices) {
+                for (SqAnDevice device:devices) {
+                    if ((device != null) && device.ipv6.equals(ipv6))
+                        return device;
+                }
+            }
+        }
+        return null;
+    }*/
 
     private void init(int uuid) {
         if (uuid == UNASSIGNED_UUID) {
@@ -129,12 +276,36 @@ public class SqAnDevice {
     public SqAnDevice getConflictingDevice() {
         int thisIpv4Address = getVpnIpv4AddressInt();
         if ((devices != null) && !devices.isEmpty()) {
-            for (SqAnDevice device:devices) {
-                if (device.getVpnIpv4AddressInt() == thisIpv4Address)
-                    return device;
+            synchronized (devices) {
+                for (SqAnDevice device : devices) {
+                    if (device.getVpnIpv4AddressInt() == thisIpv4Address)
+                        return device;
+                }
             }
         }
         return null;
+    }
+
+    /**
+     * Gets a list of devices with WiFi Aware MACs or IPV6s
+     * @return
+     */
+    public static ArrayList<SqAnDevice> getWiFiAwareDevices() {
+        ArrayList<SqAnDevice> awareDevices = null;
+        if ((devices != null) && !devices.isEmpty()) {
+            synchronized (devices) {
+                for (SqAnDevice device : devices) {
+                    if (device != null) {
+                        if (((device.awareMac != null) && device.awareMac.isValid()) || (device.awareServerIp != null)) {
+                            if (awareDevices == null)
+                                awareDevices = new ArrayList<>();
+                            awareDevices.add(device);
+                        }
+                    }
+                }
+            }
+        }
+        return awareDevices;
     }
 
     /**
@@ -168,13 +339,27 @@ public class SqAnDevice {
         return Integer.MAX_VALUE;
     }
 
-    public void setHopsAway(int hops, boolean directBt, boolean directWiFi) {
+    public void setHopsAway(int hops, boolean directBt, boolean directWiFi) { setHopsAway(hops, directBt, directWiFi,directWiFiHiPerf); }
+    public void setHopsAway(int hops, boolean directBt, boolean directWiFi, boolean directWiFiHiPerf) {
         hopsAway = hops;
         if (hopsAway == 0) {
             this.directBt = directBt;
             this.directWiFi = directWiFi;
+            this.directWiFiHiPerf = directWiFiHiPerf;
         }
     }
+
+    public void setDirectSDR(boolean directSDR) {
+        this.directSDR = directSDR;
+        hopsAway = 0;
+    }
+
+    /**
+     * Is this device connected with a high performance version of WiFi (as opposed to something like using WiFi
+     * Aware messages
+     * @return
+     */
+    public boolean isDirectWiFiHighPerformance() { return directWiFiHiPerf; }
 
     /**
      * Is this device directly connected via WiFi
@@ -248,7 +433,251 @@ public class SqAnDevice {
         return links;
     }
 
-    public static enum NodeRole { HUB, SPOKE, OFF, BOTH }
+    public boolean isBtPreferred() {
+        switch (preferredTransport) {
+            case BLUETOOTH:
+            case ALL:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    public boolean isSdrPreferred() {
+        switch (preferredTransport) {
+            case SDR:
+            case ALL:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    public boolean isWiFiPreferred() {
+        switch (preferredTransport) {
+            case WIFI:
+            case ALL:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Sets the transient ID assigned by WiFi Aware for this device
+     * @param id
+     */
+    public void setTransientAwareId(int id) {
+        transientAwareId = id;
+    }
+    public int getTransientAwareId() { return transientAwareId; }
+
+    /**
+     * Takes all the updated values from the other device then removes the other device from the list of devices
+     * @param other
+     */
+    public void consume(SqAnDevice other) {
+        if (other == null)
+            return;
+        CommsLog.log(CommsLog.Entry.Category.CONNECTION,"Device "+other.getLabel()+" is being merged into "+getLabel());
+        update(other);
+        if ((devices == null) || devices.isEmpty())
+            return; //this should not happen
+        synchronized (devices) {
+            devices.remove(other);
+        }
+    }
+
+    public void addIssue(AbstractCommsIssue issue) {
+        if (issue == null)
+            return;
+        if (issues == null)
+            issues = new ArrayList<>();
+        synchronized (issues) {
+            issues.add(issue);
+            if (issue instanceof PacketDropIssue)
+                packetsDropped++;
+            if (issues.size() > MAX_ISSUES_LOG)
+                issues.remove(0);
+        }
+    }
+
+    public int getPacketsDropped() {
+        return packetsDropped;
+    }
+
+    public MacAddress getAwareMac() {
+        return awareMac;
+    }
+
+    public void setAwareMac(MacAddress awareMac) {
+        this.awareMac = awareMac;
+    }
+
+    /**
+     * Is this device hosting a WiFi Aware server
+     * @return
+     */
+    public boolean isAwareServer() { return awareServerIp != null; }
+
+    /**
+     * Sets the IPV6 address of this device IF this device is an aware server
+     * @param awareServerIp IPV6 address of this device if aware server (or null if not)
+     */
+    public void setAwareServerIp(Inet6Address awareServerIp) {
+        if (awareServerIp == null)
+            Log.d(Config.TAG,getLabel()+" Aware Server IP cleared");
+        else
+            Log.d(Config.TAG,getLabel()+" Aware Server IP set to: "+awareServerIp.getHostAddress());
+        this.awareServerIp = awareServerIp;
+    }
+
+    public void setAwareServerIp(byte[] bytes) {
+        if ((bytes == null) || (bytes.length != NO_IPV6_ADDRESS.length)) {
+            awareServerIp = null;
+            return;
+        } else {
+            boolean isNoValue = true;
+            for (int i=0;i<bytes.length;i++) {
+                if (bytes[i] != 0) {
+                    isNoValue = false;
+                    break;
+                }
+            }
+            if (isNoValue) {
+                awareServerIp = null;
+            } else {
+                try {
+                    //awareServerIp = (Inet6Address)Inet6Address.getByAddress("aware_data",bytes,0);
+                    awareServerIp = (Inet6Address)Inet6Address.getByAddress(bytes);
+                } catch (UnknownHostException e) {
+                    Log.d(Config.TAG,"Unable to assign aware server IP: "+e.getMessage());
+                    awareServerIp = null;
+                }
+            }
+        }
+    }
+
+    /**
+     * Gets the IPV6 address of this device IF this device is an aware server
+     * @return IPV6 address of this device if aware server (or null if not)
+     */
+    public Inet6Address getAwareServerIp() { return awareServerIp; }
+
+    public void clearAwareServerIp() { awareServerIp = null; }
+
+    public void setWiFiDirectMac(MacAddress mac) { directMac = mac; }
+
+    public VpnForwardValue getIpForwardAddress(final byte index) {
+        if (forwarding != null) {
+            for (int i=0;i<forwarding.size();i++) {
+                if (forwarding.get(i).getForwardIndex() == index)
+                    return forwarding.get(i);
+            }
+        }
+        Log.w(Config.TAG,"Unable to find forwarding address; no device at index "+index);
+        return null;
+    }
+
+    public ArrayList<VpnForwardValue> getIpForwardAddresses() { return forwarding; }
+
+    private void sortForwarding() {
+        if ((forwarding == null) || (forwarding.size() < 2))
+            return;
+        boolean complete = false;
+        VpnForwardValue temp;
+        while (!complete) {
+            complete = true;
+            for (int i=1;i<forwarding.size();i++) {
+                if (forwarding.get(i).getForwardIndex() < forwarding.get(i-1).getForwardIndex()) {
+                    temp = forwarding.get(i);
+                    forwarding.set(i,forwarding.get(i-1));
+                    forwarding.set(i-1,temp);
+                    complete = false;
+                }
+            }
+        }
+    }
+
+    public byte getNextFowardingIndex() {
+        if (forwarding == null)
+            return 0;
+        sortForwarding();
+        int last = 1;
+        for (int i=0;i<forwarding.size();i++) {
+            if (forwarding.get(i).getForwardIndex() > last)
+                break;
+            last = forwarding.get(i).getForwardIndex() + 1;
+        }
+        return (byte)(last & 0xFF);
+    }
+
+    public void addVpnForwardValue(VpnForwardValue value) {
+        if (value == null)
+            return;
+        if (forwarding == null) {
+            forwarding = new ArrayList<>();
+            forwarding.add(value);
+        }
+
+        //move any forwarding record currently in this index to another place
+        byte indexToInsert = value.getForwardIndex();
+        for (int i=0;i<forwarding.size();i++) {
+            if (forwarding.get(i).getForwardIndex() == indexToInsert) {
+                if (forwarding.get(i).getAddress() == value.getAddress())
+                    return; //this record already exists and is in the right index
+                Log.d(Config.TAG,AddressUtil.intToIpv4String(forwarding.get(i).getAddress())+" was being forwarded as "
+                        +AddressUtil.intToIpv4String(AddressUtil.getSqAnVpnIpv4Address(uuid,indexToInsert))
+                        +" but is being moved so "+AddressUtil.intToIpv4String(value.getAddress())
+                        +" can be reached at that IP");
+                forwarding.get(i).setIndex(getNextFowardingIndex());
+            }
+        }
+
+        for (int i=0;i<forwarding.size();i++) {
+            if (forwarding.get(i).getAddress() == value.getAddress()) {
+                forwarding.set(i,value); //update any index issue and close
+                return;
+            }
+        }
+        forwarding.add(value);
+    }
+
+    /**
+     * Gets the forward value for this IP address or adds it if not already on the list
+     * @param ipv4
+     * @param addIfNotPresent
+     * @return
+     */
+    public VpnForwardValue getOrAddIpForwardAddress(final int ipv4, boolean addIfNotPresent) {
+        VpnForwardValue value = null;
+        if (forwarding == null) {
+            if (addIfNotPresent) {
+                forwarding = new ArrayList<>();
+                value = new VpnForwardValue(getNextFowardingIndex(), ipv4);
+                forwarding.add(value);
+            }
+        } else {
+            for (int i=0;i<forwarding.size();i++) {
+                if (forwarding.get(i).getAddress() == ipv4)
+                    return forwarding.get(i);
+            }
+            if (forwarding.size() > 254) {
+                Log.w(Config.TAG,"A SqAN node can only forward 254 IPV4 addresses; "+AddressUtil.intToIpv4String(ipv4)+" is being ignored");
+                return null;
+            }
+            if (addIfNotPresent) {
+                value = new VpnForwardValue(getNextFowardingIndex(), ipv4);
+                forwarding.add(value);
+            }
+        }
+        return value;
+    }
+
+    public enum NodeRole { HUB, SPOKE, OFF, BOTH }
 
     /**
      * Look for and merge any likely duplicate nodes
@@ -336,6 +765,8 @@ public class SqAnDevice {
                     else
                         device.removePreferBt();
                 }
+                if (device.directSDR)
+                    device.addPreferSDR();
             } else
                 device.preferredTransport = TransportPreference.AGNOSTIC;
         }
@@ -347,8 +778,8 @@ public class SqAnDevice {
     public void addPreferWiFi() {
         switch (preferredTransport) {
             case BLUETOOTH:
-            case BOTH:
-                preferredTransport = TransportPreference.BOTH;
+            case ALL:
+                preferredTransport = TransportPreference.ALL;
                 break;
 
             default:
@@ -362,8 +793,8 @@ public class SqAnDevice {
     public void addPreferBt() {
         switch (preferredTransport) {
             case WIFI:
-            case BOTH:
-                preferredTransport = TransportPreference.BOTH;
+            case ALL:
+                preferredTransport = TransportPreference.ALL;
                 break;
 
             default:
@@ -372,11 +803,27 @@ public class SqAnDevice {
     }
 
     /**
+     * Updates this device's routing preference to include WiFi
+     */
+    public void addPreferSDR() {
+        switch (preferredTransport) {
+            case WIFI:
+            case BLUETOOTH:
+            case ALL:
+                preferredTransport = TransportPreference.ALL;
+                break;
+
+            default:
+                preferredTransport = TransportPreference.SDR;
+        }
+    }
+
+    /**
      * Updates this device's routing preference to exclude WiFI
      */
     public void removePreferWiFi() {
         switch (preferredTransport) {
-            case BOTH:
+            case ALL:
             case BLUETOOTH:
                 preferredTransport = TransportPreference.BLUETOOTH;
                 break;
@@ -391,7 +838,7 @@ public class SqAnDevice {
      */
     public void removePreferBt() {
         switch (preferredTransport) {
-            case BOTH:
+            case ALL:
             case WIFI:
                 preferredTransport = TransportPreference.WIFI;
                 break;
@@ -562,7 +1009,7 @@ public class SqAnDevice {
         CONNECTED,
         //TODO add a CHALLENGING status to support encrypted handshakes within network
         //TODO add a COUNTERSIGNING status to support encrypted handshakes within network
-        //FIXME note: encrypted internal connections are outside opf the scope of this project and will be handled sepsrately
+        //FIXME note: encrypted internal connections are outside of the scope of this project and will be handled sepsrately
         STALE,
         ERROR,
         OFFLINE
@@ -735,10 +1182,14 @@ public class SqAnDevice {
         }
         if (other.networkId != null)
             networkId = other.networkId;
+        if (other.transientAwareId != UNASSIGNED_UUID)
+            transientAwareId = other.transientAwareId;
         if (other.callsign != null)
             callsign = other.callsign;
         if (other.uuidExtended != null)
             uuidExtended = other.uuidExtended;
+        if (other.awareMac != null)
+            awareMac = other.awareMac;
         if (other.lastLocation != null) {
             if ((lastLocation == null) || !lastLocation.isValid() || (other.lastLocation.getTime() > lastLocation.getTime()))
                 lastLocation = other.lastLocation;
@@ -784,6 +1235,8 @@ public class SqAnDevice {
         if ((other.networkId != null) && (networkId != null) && (other.networkId.length() > 1) && other.networkId.equalsIgnoreCase(networkId))
             return true;
         if ((bluetoothMac != null) && bluetoothMac.isEqual(other.bluetoothMac))
+            return true;
+        if ((transientAwareId != UNASSIGNED_UUID) && (transientAwareId == other.transientAwareId))
             return true;
         return false;
     }
@@ -861,7 +1314,7 @@ public class SqAnDevice {
             return true;
         } else {
             existing.update(device);
-            SavedTeammate teammate = new SavedTeammate(device.getUUID(),device.networkId);
+            SavedTeammate teammate = new SavedTeammate(device.getUUID());
             teammate.setBluetoothMac(device.bluetoothMac);
             Config.saveTeammate(teammate);
         }
@@ -877,6 +1330,12 @@ public class SqAnDevice {
             return callsign;
         if (uuid > 0)
             return Integer.toString(uuid);
+        if ((networkId != null) && (networkId.length() > 1))
+            return "WiFi "+networkId;
+        if ((bluetoothMac != null) && bluetoothMac.isValid())
+            return "BT "+bluetoothMac.toString();
+        if (transientAwareId != UNASSIGNED_UUID)
+            return "Aware ID "+transientAwareId;
         return "unknown";
     }
 
@@ -983,6 +1442,30 @@ public class SqAnDevice {
     }
 
     /**
+     * Finds a device in the list of devices based on WiFi Direct MAC
+     * @param mac WiFi Direct MAC
+     * @return the device (or null if not found)
+     */
+    public static SqAnDevice findByWiFiDirectMac(String mac) { return findByWiFiDirectMac(MacAddress.build(mac)); }
+
+    /**
+     * Finds a device in the list of devices based on WiFi Direct MAC
+     * @param mac WiFi Direct MAC
+     * @return the device (or null if not found)
+     */
+    public static SqAnDevice findByWiFiDirectMac(MacAddress mac) {
+        if ((mac != null) && (devices != null) && !devices.isEmpty()) {
+            synchronized (devices) {
+                for (SqAnDevice device : devices) {
+                    if ((device != null) && (mac.isEqual(device.directMac)))
+                        return device;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Finds a device in the list of devices based on its SqAnAddress (which is
      * different than its UUID; the SqAnAddress represents a temporary address
      * to find this device on the SqAN mesh and usually is the integer equivalent
@@ -1068,11 +1551,15 @@ public class SqAnDevice {
     public long getDataTally() {
         return rxDataTally;
     }
+    public void markDataTallyDisplayed() { displayedRxTally = rxDataTally; }
+    public boolean isDataTallyGuiNeedUpdate() { return rxDataTally > displayedRxTally; }
     public String getNetworkId() {
         return networkId;
     }
     public void setNetworkId(String networkId) { this.networkId = networkId; }
-    public void setConnected(int hopsAway, boolean directBt, boolean directWiFi) {
+    public void setDirectWiFiHiPerf(boolean isWifiInHighPerformanceMode) { this.directWiFiHiPerf = isWifiInHighPerformanceMode; }
+    public void setConnected(int hopsAway, boolean directBt, boolean directWiFi) { setConnected(hopsAway, directBt, directWiFi,directWiFiHiPerf); }
+    public void setConnected(int hopsAway, boolean directBt, boolean directWiFi, boolean directWiFiHiPerf) {
         setStatus(Status.CONNECTED);
         setLastConnect(System.currentTimeMillis());
         if (connectTime < 0l)
@@ -1080,12 +1567,15 @@ public class SqAnDevice {
         if (hopsAway > this.hopsAway) {
             if (System.currentTimeMillis() > lastHopUpdate + TIME_TO_CONSIDER_HOP_COUNT_STALE) {
                 lastHopUpdate = System.currentTimeMillis();
-                setHopsAway(hopsAway, directBt, directWiFi);
+                setHopsAway(hopsAway, directBt, directWiFi, directWiFiHiPerf);
             }
         } else {
             lastHopUpdate = System.currentTimeMillis();
-            setHopsAway(hopsAway, directBt, directWiFi);
+            setHopsAway(hopsAway, directBt, directWiFi, directWiFiHiPerf);
         }
+    }
+
+    public void setLastConnect() { setLastConnect(System.currentTimeMillis());
     }
     public void setLastConnect(long time) {
         lastConnect = time;
@@ -1171,6 +1661,12 @@ public class SqAnDevice {
         if (this.roleWiFi != roleWiFi) {
             CommsLog.log(CommsLog.Entry.Category.STATUS,"WiFi role now "+roleWiFi.name());
             this.roleWiFi = roleWiFi;
+            if (roleWiFi == NodeRole.OFF) {
+                addIssue(new WiFiConnectivityIssue());
+                staleRolesCheck();
+                if (uiSummary != null)
+                    uiSummary.update(this);
+            }
         }
     }
 
@@ -1188,7 +1684,25 @@ public class SqAnDevice {
         if (this.roleBT != roleBT) {
             CommsLog.log(CommsLog.Entry.Category.STATUS,"Bluetooth role now "+roleBT.name());
             this.roleBT = roleBT;
+            if (roleBT == NodeRole.OFF)
+                staleRolesCheck();
         }
+    }
+
+    public NodeRole getRoleSDR() { return roleSDR; }
+
+    public void setRoleSDR(NodeRole roleSDR) {
+        if (this.roleSDR != roleSDR) {
+            CommsLog.log(CommsLog.Entry.Category.STATUS,"SDR role now "+roleSDR.name());
+            this.roleSDR = roleSDR;
+            if (roleSDR == NodeRole.OFF)
+                staleRolesCheck();
+        }
+    }
+
+    private void staleRolesCheck() {
+        if ((roleWiFi == NodeRole.OFF) && (roleBT == NodeRole.OFF) && (roleSDR == NodeRole.OFF))
+            setStatus(Status.STALE);
     }
 
     /**
@@ -1218,5 +1732,25 @@ public class SqAnDevice {
         if (other == null)
             return false;
         return getVpnIpv4AddressInt() == other.getVpnIpv4AddressInt();
+    }
+
+    private final static byte MASK_NONE =         (byte)0b00000000;
+    private final static byte MASK_BACKHAUL =     (byte)0b10000000;
+    private final static byte MASK_RESERVED_2 =   (byte)0b01000000;
+    private final static byte MASK_RESERVED_3 =   (byte)0b00100000;
+    private final static byte MASK_RESERVED_4 =   (byte)0b00010000;
+    private final static byte MASK_RESERVED_5 =   (byte)0b00001000;
+    private final static byte MASK_RESERVED_6 =   (byte)0b00000100;
+    private final static byte MASK_RESERVED_7 =   (byte)0b00000010;
+    private final static byte MASK_RESERVED_8 =   (byte)0b00000001;
+
+    public byte getFlags() {
+        byte flags = backhaulConnection?MASK_BACKHAUL:MASK_NONE;
+
+        return flags;
+    }
+
+    public void parseFlags(byte data) {
+        backhaulConnection = (MASK_BACKHAUL & data) == MASK_BACKHAUL;
     }
 }

@@ -10,9 +10,13 @@ import org.sofwerx.sqan.manet.common.pnt.NetworkTime;
 import org.sofwerx.sqan.manet.common.pnt.SpaceTime;
 
 import java.io.UnsupportedEncodingException;
+import java.net.Inet6Address;
+import java.net.UnknownHostException;
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+
+import javax.crypto.Mac;
 
 public class HeartbeatPacket extends AbstractPacket {
     private SqAnDevice device;
@@ -48,6 +52,17 @@ public class HeartbeatPacket extends AbstractPacket {
         MEDIUM
     }
 
+
+    @Override
+    protected byte getChecksum() {
+        byte checksum = 0;
+        if (device != null) { //just base checksum on device UID
+            checksum = (byte) ((device.getUUID() | (device.getUUID()<<4) |
+                    (device.getUUID() << 8) | (device.getUUID() << 12)) & PacketHeader.MASK_CHECKSUM);
+        }
+        return checksum;
+    }
+
     @Override
     public void parse(byte[] bytes) {
         if ((bytes == null) || (packetHeader == null))
@@ -68,8 +83,15 @@ public class HeartbeatPacket extends AbstractPacket {
                     if (!spaceTime.isValid())
                         spaceTime = null;
                     device.setLastLocation(spaceTime);
-                    if (buf.remaining() <4)
+                    if (buf.remaining() < MacAddress.MAC_BYTE_SIZE + 1 + 16 + 4)
                         return;
+                    byte[] awareMacBytes = new byte[MacAddress.MAC_BYTE_SIZE];
+                    buf.get(awareMacBytes);
+                    device.setAwareMac(new MacAddress(awareMacBytes));
+                    device.parseFlags(buf.get());
+                    byte[] awareIpv6Bytes = new byte[SqAnDevice.NO_IPV6_ADDRESS.length];
+                    buf.get(awareIpv6Bytes);
+                    device.setAwareServerIp(awareIpv6Bytes);
                     int relaySize = buf.getInt();
                     if (relaySize > 0) {
                         byte[] relayBytes = new byte[RelayConnection.SIZE];
@@ -181,7 +203,16 @@ public class HeartbeatPacket extends AbstractPacket {
             int nums = 0;
             if (relays != null)
                 nums = relays.size();
-            relayBuf = ByteBuffer.allocate(4 + nums * RelayConnection.SIZE);
+            relayBuf = ByteBuffer.allocate(MacAddress.MAC_BYTE_SIZE + 1 + 16 + 4 + nums * RelayConnection.SIZE);
+            MacAddress awareMac = device.getAwareMac();
+            if (awareMac == null)
+                awareMac = new MacAddress();
+            relayBuf.put(awareMac.toByteArray());
+            relayBuf.put(device.getFlags());
+            if (device.isAwareServer())
+                relayBuf.put(device.getAwareServerIp().getAddress());
+            else
+                relayBuf.put(SqAnDevice.NO_IPV6_ADDRESS);
             relayBuf.putInt(nums);
             if (relays != null) {
                 for (RelayConnection relay:relays) {
@@ -225,7 +256,7 @@ public class HeartbeatPacket extends AbstractPacket {
     }
 
     @Override
-    protected int getType() {
+    protected byte getType() {
         return PacketHeader.PACKET_TYPE_HEARTBEAT;
     }
 

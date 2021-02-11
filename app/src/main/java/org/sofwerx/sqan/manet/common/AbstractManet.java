@@ -1,14 +1,15 @@
 package org.sofwerx.sqan.manet.common;
 
-import android.content.Context;
+import org.sofwerx.notdroid.content.Context;
 import android.content.pm.PackageManager;
-import android.os.Handler;
-import android.util.Log;
+import org.sofwerx.notdroid.os.Handler;
+import org.sofwerx.notdroid.util.Log;
 
 import org.sofwerx.sqan.Config;
 import org.sofwerx.sqan.SavedTeammate;
 import org.sofwerx.sqan.SqAnService;
 import org.sofwerx.sqan.listeners.ManetListener;
+import org.sofwerx.sqan.listeners.PeripheralStatusListener;
 import org.sofwerx.sqan.manet.bt.BtManetV2;
 import org.sofwerx.sqan.manet.common.issues.WiFiIssue;
 import org.sofwerx.sqan.manet.common.packet.DisconnectingPacket;
@@ -19,17 +20,21 @@ import org.sofwerx.sqan.manet.common.sockets.PacketParser;
 import org.sofwerx.sqan.manet.nearbycon.NearbyConnectionsManet;
 import org.sofwerx.sqan.manet.common.packet.AbstractPacket;
 import org.sofwerx.sqan.manet.common.packet.SegmentTool;
-import org.sofwerx.sqan.manet.wifiaware.WiFiAwareManet;
+import org.sofwerx.sqan.manet.sdr.SdrManet;
+import org.sofwerx.sqan.manet.wifiaware.WiFiAwareManetV2;
 import org.sofwerx.sqan.manet.wifidirect.WiFiDirectManet;
 import org.sofwerx.sqan.util.CommsLog;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.sofwerx.sqandr.Config.isAndroid;
 
 /**
  * Abstract class that handles all broad MANET activity. This abstracts away any MANET specific
  * implementation issues and lets SqAN deal with all MANETs in a uniform manner.
  */
 public abstract class AbstractManet {
+    public final static int SQAN_PORT = 1716; //using the America's Army port to avoid likely conflicts
     protected Status status = Status.OFF;
     protected ManetListener listener;
     protected AtomicBoolean isRunning = new AtomicBoolean(false);
@@ -48,11 +53,28 @@ public abstract class AbstractManet {
      */
     public AbstractManet(Handler handler, Context context, ManetListener listener) {
         this.handler = handler;
-        this.context = context;
+        if (isAndroid()) {
+            this.context = new Context(context.getApplicationContext());
+        } else {
+            this.context = context;
+        }
         this.listener = listener;
         SegmentTool.setMaxPacketSize(getMaximumPacketSize());
         parser = new PacketParser(this);
     }
+
+    public AbstractManet(android.os.Handler handler, android.content.Context context, ManetListener listener) {
+        this.handler = new Handler(handler);
+        this.context = new Context (context.getApplicationContext());
+        this.listener = listener;
+        SegmentTool.setMaxPacketSize(getMaximumPacketSize());
+        parser = new PacketParser(this);
+    }
+    /**
+     * Sets the listener for any status reports from a peripheral (most manet will not have a peripheral)
+     * @param listener
+     */
+    public abstract void setPeripheralStatusListener(PeripheralStatusListener listener);
 
     /**
      * Gets they type of MANET in use (i.e. Nearby Connections, WiFi Aware, WiFi Direct
@@ -60,20 +82,28 @@ public abstract class AbstractManet {
      */
     public abstract ManetType getType();
 
+    public Handler getHandler() { return handler; }
+
     /**
      * Checks for any issues blocking or impeding MANET
      * @return true == some issue exists effecting the MANET
      */
     public boolean checkForSystemIssues() {
         boolean passed = true;
-        if (!context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI)) {
-            SqAnService.onIssueDetected(new WiFiIssue(true,"WiFi absent"));
-            passed = false;
+        if (isAndroid()) {
+            if (!context.toAndroid().getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI)) {
+                SqAnService.onIssueDetected(new WiFiIssue(true, "WiFi absent"));
+                passed = false;
+            }
         }
         return passed;
     }
 
+    public PacketParser getParser() { return parser; }
+
     public abstract int getMaximumPacketSize();
+
+    public abstract boolean isCongested();
 
     /**
      * Intended to support more efficient radio operations by allowing devices to stop
@@ -85,16 +115,19 @@ public abstract class AbstractManet {
     public final static AbstractManet newFromType(Handler handler, Context context, ManetListener listener, ManetType type) {
         switch (type) {
             case NEARBY_CONNECTION:
-                return new NearbyConnectionsManet(handler, context, listener);
+                return new NearbyConnectionsManet(handler.toAndroid(), context.toAndroid(), listener);
 
             case WIFI_AWARE:
-                return new WiFiAwareManet(handler, context, listener);
+                return new WiFiAwareManetV2(handler.toAndroid(), context.toAndroid(), listener);
 
             case WIFI_DIRECT:
-                return new WiFiDirectManet(handler, context, listener);
+                return new WiFiDirectManet(handler.toAndroid(), context.toAndroid(), listener);
 
             case BT_ONLY:
-                return new BtManetV2(handler, context, listener);
+                return new BtManetV2(handler.toAndroid(), context.toAndroid(), listener);
+
+            case SDR:
+                return new SdrManet(handler, context, listener);
 
             default:
                 return null;
@@ -137,8 +170,11 @@ public abstract class AbstractManet {
                 changed = (this.status != status);
                 this.status = status;
         }
-        if (changed && (listener != null))
-            listener.onStatus(this.status);
+        if (changed) {
+            CommsLog.log(CommsLog.Entry.Category.STATUS,getName()+" status changed to "+this.status.name());
+            if (listener != null)
+                listener.onStatus(this.status);
+        }
     }
 
     /**
@@ -173,10 +209,16 @@ public abstract class AbstractManet {
     }
 
     public void onReceived(AbstractPacket packet) {
-        if (packet == null)
-            Log.d(Config.TAG,"Empty packet received over "+getClass());
+        if (packet == null) {
+            Log.d(Config.TAG, "Empty packet received over " + getClass().getSimpleName());
+            return;
+        }
         if ((packet.getOrigin() == Config.getThisDevice().getUUID()) && !(packet instanceof PingPacket)) {
             Log.d(Config.TAG,"Circular reporting detected - dropping packet");
+            return;
+        }
+        if ((packet instanceof HeartbeatPacket) && !packet.isValid()) {
+            Log.d(Config.TAG,"Invalid heartbeat packet dropped from onReceived");
             return;
         }
         setStatus(Status.CONNECTED);
@@ -220,7 +262,7 @@ public abstract class AbstractManet {
                     callsign = hb.getDevice().getCallsign();
             }
             if (callsign == null)
-                callsign = "SqAN ID "+Integer.toString(packet.getOrigin());
+                callsign = "SqAN ID "+packet.getOrigin();
             CommsLog.log(CommsLog.Entry.Category.COMMS,"Connected to device "+callsign);
             if (packet.getOrigin() > 0) {
                 device = new SqAnDevice(packet.getOrigin());
@@ -236,8 +278,6 @@ public abstract class AbstractManet {
                     listener.onDevicesChanged(device);
             }
         } else {
-            if (packet instanceof HeartbeatPacket)
-                device.update(((HeartbeatPacket)packet).getDevice());
             device.setLastEntry(new CommsLog.Entry(CommsLog.Entry.Category.STATUS, "Operating normally"));
             if (packet.getCurrentHopCount() == 0)
                 device.setConnected(0,isBluetoothBased(),isWiFiBased());

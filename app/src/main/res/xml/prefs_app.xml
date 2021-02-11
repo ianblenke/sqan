@@ -34,6 +34,17 @@
             android:title="Notify when needs repair"
             android:summary="Notify me when a setup for a teammate has incomplete information and needs to be repaired."
             android:defaultValue="true"/>
+
+        <EditTextPreference
+            android:key="passcode"
+            android:title="Network Passcode"
+            android:summary="The passcode used to for the network. This is a temporary solution until a network negotiated passcode scheme is put in place." />
+
+        <Preference
+            android:key="sdrsettings"
+            android:title="SDR Settings"
+            android:summary="Software Defined Radio settings" />
+
     </PreferenceCategory>
 
     <PreferenceCategory
@@ -41,7 +52,7 @@
         <CheckBoxPreference
             android:key="vpnmode"
             android:title="VPN Mode"
-            android:summary="SqAN will capture all data going to IP addresses that start with 169.254.x.x and forward them in the mesh."
+            android:summary="SqAN will capture all data going to IP addresses that start with 169.x.x.x, 224.x.x.x, 225.x.x.x, 226.x.x.x or 239.x.x.x and forward them in the mesh."
             android:defaultValue="true"/>
 
         <CheckBoxPreference
@@ -49,6 +60,53 @@
             android:dependency="vpnmode"
             android:title="Host a VPN page"
             android:summary="Host a web page on this device that provides basic device stats. Primarily used for checking connectivity."
+            android:defaultValue="true"/>
+
+        <EditTextPreference
+            android:key="mtu"
+            android:dependency="vpnmode"
+            android:title="MTU"
+            android:summary="VPN Maximum Transmission Unit size (bytes)"
+            android:defaultValue="1500"/>
+
+        <!--<CheckBoxPreference
+            android:key="vpnfwd"
+            android:dependency="vpnmode"
+            android:title="Forward Connected IPs"
+            android:summary="Allow VPN to forward any connected IP device."
+            android:defaultValue="true"/>
+
+        <Preference
+            android:key="vpnfwdsettings"
+            android:title="Forwarded addresses"
+            android:summary="Addresses captured and forwarded by the VPN." />
+
+        <CheckBoxPreference
+            android:key="vpnautoadd"
+            android:dependency="vpnfwd"
+            android:title="Auto forward IPs"
+            android:summary="Allow VPN to automatically start forwarding any device that broadcasts or tries to hit a SqAN IP address."
+            android:defaultValue="true"/>-->
+
+        <CheckBoxPreference
+            android:key="multicast"
+            android:dependency="vpnmode"
+            android:title="Forward multicast"
+            android:summary="Forward multicast traffic over the VPN"
+            android:defaultValue="true"/>
+
+        <CheckBoxPreference
+            android:key="bigpipesonly"
+            android:dependency="vpnmode"
+            android:title="Large Data over Big Pipes Only"
+            android:summary="Only send large data (like video streams) over connections with large pipes (like WiFi)."
+            android:defaultValue="true"/>
+
+        <CheckBoxPreference
+            android:key="no0000"
+            android:dependency="vpnmode"
+            android:title="Ignore 0.0.0.0"
+            android:summary="Do not forward any traffic sent to IP address 0.0.0.0"
             android:defaultValue="true"/>
     </PreferenceCategory>
 
@@ -84,6 +142,12 @@
             android:title="Log"
             android:summary="Produce a log file for detailed analysis of mesh behavior"
             android:defaultValue="true"/>
+
+        <CheckBoxPreference
+            android:key="silent"
+            android:title="SDR Silent"
+            android:summary="Switches SqAN to silent/listen only mode when using an SDR"
+            android:defaultValue="false"/>
     </PreferenceCategory>
 
 </PreferenceScreen>

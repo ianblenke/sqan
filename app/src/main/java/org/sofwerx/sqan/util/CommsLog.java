@@ -3,10 +3,13 @@ package org.sofwerx.sqan.util;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.util.Log;
 
 import org.sofwerx.sqan.Config;
+import org.sofwerx.sqan.manet.common.SqAnDevice;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -22,6 +25,7 @@ import androidx.core.content.ContextCompat;
 public class CommsLog {
     private final static int MAX_LOG_LENGTH = 20;
     private static ArrayList<Entry> entries = null;
+    private static File file;
     private static FileOutputStream fos;
     private static OutputStreamWriter oswriter;
     private static BufferedWriter bwriter;
@@ -37,9 +41,17 @@ public class CommsLog {
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
                     File logDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),"SqAN");
                     logDir.mkdirs();
-                    File file1 = new File(logDir,StringUtil.getFilesafeTime(System.currentTimeMillis())+".txt");
-                    file1.createNewFile();
-                    fos = new FileOutputStream(file1);
+                    StringWriter filename = new StringWriter();
+                    filename.append(StringUtil.getFilesafeTime(System.currentTimeMillis()));
+                    String cs = Config.getCallsign(context);
+                    if (cs != null) {
+                        filename.append(' ');
+                        filename.append(cs);
+                    }
+                    filename.append(".txt");
+                    file = new File(logDir,filename.toString());
+                    file.createNewFile();
+                    fos = new FileOutputStream(file);
                     oswriter = new OutputStreamWriter(fos);
                     bwriter = new BufferedWriter(oswriter);
                     isRunning.set(true);
@@ -47,6 +59,28 @@ public class CommsLog {
             } catch (Exception e) {
                 e.printStackTrace();
                 isRunning.set(false);
+            }
+            try {
+                bwriter.append("Comms log started on ");
+                bwriter.newLine();
+                bwriter.append("  ");
+                bwriter.append(Build.MANUFACTURER);
+                bwriter.append(' ');
+                bwriter.append(Build.MODEL);
+                SqAnDevice device = Config.getThisDevice();
+                if (device != null) {
+                    bwriter.newLine();
+                    bwriter.append("  SqAN UUID ");
+                    bwriter.append(Integer.toString(device.getUUID()));
+                }
+                bwriter.newLine();
+                bwriter.append("  last reboot ");
+                bwriter.append(StringUtil.toDuration(SystemClock.elapsedRealtime()));
+                bwriter.append(" ago");
+                bwriter.newLine();
+                bwriter.append(" ------------------------ ");
+                bwriter.newLine();
+            } catch (Exception ignore) {
             }
         } else
             close();
@@ -80,11 +114,19 @@ public class CommsLog {
         }
     }
 
+    public static File getFileAndStartNew(Context context) {
+        File fileToReport = file;
+        close();
+        init(context);
+        return fileToReport;
+    }
+
     public static class Entry {
         public enum Category {
             PROBLEM,
             STATUS,
             COMMS,
+            SDR,
             CONNECTION
         }
 
@@ -110,6 +152,10 @@ public class CommsLog {
             switch (category) {
                 case PROBLEM:
                     out.append("[PROBLEM]");
+                    break;
+
+                case SDR:
+                    out.append("[SDR]");
                     break;
 
                 case CONNECTION:

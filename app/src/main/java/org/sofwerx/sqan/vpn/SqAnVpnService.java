@@ -18,10 +18,16 @@ import android.widget.Toast;
 import org.sofwerx.sqan.Config;
 import org.sofwerx.sqan.R;
 import org.sofwerx.sqan.SqAnService;
+import org.sofwerx.sqan.manet.common.SqAnDevice;
+import org.sofwerx.sqan.manet.common.VpnForwardValue;
 import org.sofwerx.sqan.ui.SettingsActivity;
+import org.sofwerx.sqan.util.AddressUtil;
+import org.sofwerx.sqan.util.NetUtil;
+import org.sofwerx.sqandr.util.StringUtils;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -35,12 +41,17 @@ public class SqAnVpnService extends VpnService implements Handler.Callback {
     private FileOutputStream out;
     private Handler mHandler;
     private int lastMessage = R.string.disconnected;
+    private static SqAnDevice thisDevice;
+    private static int thisDeviceIp;
 
     public static void start(final Context context) {
         if (context != null) {
             Intent intent = new Intent(context, SqAnVpnService.class);
             intent.setAction(SqAnVpnService.ACTION_CONNECT);
             context.startService(intent);
+            thisDevice = Config.getThisDevice();
+            if (thisDevice != null)
+                thisDeviceIp = AddressUtil.getSqAnVpnIpv4Address(thisDevice.getUUID());
         }
     }
 
@@ -49,6 +60,7 @@ public class SqAnVpnService extends VpnService implements Handler.Callback {
             Intent intent = new Intent(context, SqAnVpnService.class);
             intent.setAction(SqAnVpnService.ACTION_DISCONNECT);
             context.startService(intent);
+            thisDevice = null;
         }
     }
 
@@ -58,6 +70,31 @@ public class SqAnVpnService extends VpnService implements Handler.Callback {
         if (out != null) {
             Log.d(TAG,data.length+"b VpnPacket data received from SqAN");
             try {
+                if (Config.isVpnForwardIps() && (thisDevice != null)) {
+                    int dest = NetUtil.getDestinationIpFromIpPacket(data);
+                    byte[] destBytes = NetUtil.intToByteArray(dest);
+                    int srcPort = NetUtil.getSourcePort(data);
+                    int destPort = NetUtil.getDestinationPort(data);
+
+                    if (dest != thisDeviceIp) {
+                        VpnForwardValue forward = thisDevice.getIpForwardAddress(destBytes[1]);
+                        if (forward != null) {
+                            byte[] actualDest = NetUtil.intToByteArray(forward.getAddress());
+                            Log.d(TAG,"VPN Packet received for "+AddressUtil.intToIpv4String(dest)+"(src port "+srcPort+", dest port "+destPort+") redirecting to "+AddressUtil.intToIpv4String(NetUtil.byteArrayToInt(actualDest)));
+                            NetUtil.changeIpv4HeaderDst(data,actualDest);
+                            SqAnVpnConnection.swapIpInPayload(data,destBytes,actualDest);
+                        }
+                    }
+                } else {
+                    //FIXME for testing
+                    int dest = NetUtil.getDestinationIpFromIpPacket(data);
+                    int destPort = NetUtil.getDestinationPort(data);
+                    String ipAdd = AddressUtil.intToIpv4String(dest);
+                    String port = Integer.toString(destPort);
+                    Log.d(TAG,"VpnPkt in from SqAN ("+ipAdd+":"+port+"): "+new String(data,StandardCharsets.US_ASCII));
+                    Log.d(TAG,"VpnPkt in from SqAN ("+ipAdd+":"+port+"): "+StringUtils.toHex(data));
+                    //FIXME for testing
+                }
                 out.write(data);
             } catch (IOException e) {
                 Log.e(TAG,"Unable to forward VpnPacket from SqAN to the VPN:"+e.getMessage());
@@ -120,6 +157,7 @@ public class SqAnVpnService extends VpnService implements Handler.Callback {
         if (SqAnService.getInstance() != null)
             SqAnService.getInstance().setVpnService(this);
     }
+
     private void startConnection(final SqAnVpnConnection connection) {
         final Thread thread = new Thread(connection, "SqAnVpnThread");
         setConnectingThread(thread);
@@ -131,6 +169,7 @@ public class SqAnVpnService extends VpnService implements Handler.Callback {
         });
         thread.start();
     }
+
     private void setConnectingThread(final Thread thread) {
         final Thread oldThread = mConnectingThread.getAndSet(thread);
         if (oldThread != null)

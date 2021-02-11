@@ -10,9 +10,11 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.sofwerx.sqan.manet.common.MacAddress;
 import org.sofwerx.sqan.manet.common.SqAnDevice;
+import org.sofwerx.sqan.manet.common.VpnForwardValue;
 import org.sofwerx.sqan.manet.common.packet.PacketHeader;
 import org.sofwerx.sqan.util.CommsLog;
 import org.sofwerx.sqan.util.UuidUtil;
+import org.sofwerx.sqandr.sdr.SdrConfig;
 
 import java.util.ArrayList;
 
@@ -28,23 +30,43 @@ public class Config {
     private final static String PREFS_UUID_EXTENDED = "uuid_extended";
     private final static String PREFS_UUID = "uuid";
     private final static String PREFS_CALLSIGN = "callsign";
+    private final static String PREFS_PASSCODE = "passcode";
     public final static String PREFS_MANET_ENGINE = "manetType";
     public final static String PREF_CLEAR_TEAM = "clearteam";
     private final static String PREFS_SAVED_TEAM = "savedteam";
     public final static String PREFS_VPN_MODE = "vpnmode";
+    public final static String PREFS_VPN_MULTICAST = "multicast";
+    public final static String PREFS_VPN_EDIT_FORWARDS = "vpnfwdsettings";
+    public final static String PREFS_IGNORE_0_0_0_0 = "no0000";
+    public final static String PREFS_LARGE_DATA_WIFI_ONLY = "bigpipesonly";
     private final static String PREFS_VPN_LANDING_PAGE = "vpn404";
+    public final static String PREFS_VPN_MTU = "mtu";
+    public final static String PREFS_VPN_FORWARD = "vpnfwd";
+    public final static String PREFS_VPN_AUTO_ADD = "vpnautoadd";
+    public final static String PREFS_VPN_FORWARDED_IPS = "vpnfwdips";
     public final static String PREFS_WRITE_LOG = "log";
     public final static String PREFS_WARN_INCOMPLETE = "incomplete";
+    public final static String PREFS_SDR_SETTINGS = "sdrsettings";
+    public final static String PREFS_SDR_LISTEN_ONLY = "silent";
+    private final static String DEFAULT_PASSCODE = "SwxTest";
     private static boolean debugMode = false;
     private static boolean allowIpcComms = true;
     private static boolean broadcastSa = true;
     private static boolean includeConnections = false;
     private static boolean vpnMode = true;
+    private static boolean vpnForward = true;
+    private static boolean vpnAutoAdd = true;
+    private static boolean multicast = true;
     private static boolean vpnLandingPage = true;
     private static boolean writeLog = true;
     private static boolean warnIncomplete = true;
+    private static boolean ignore0000 = true;
+    private static boolean largeDataWiFiOnly = true;
+    private static boolean silent = false;
+    private static int mtuSize = 1500;
     private static SqAnDevice thisDevice = null;
     private static ArrayList<SavedTeammate> savedTeammates;
+    private static String passcode;
 
     public static void init(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
@@ -53,6 +75,8 @@ public class Config {
         int uuid = prefs.getInt(PREFS_UUID,UuidUtil.getNewUUID());
         String uuidExtended = prefs.getString(PREFS_UUID_EXTENDED,UuidUtil.getNewExtendedUUID());
         String callsign = prefs.getString(PREFS_CALLSIGN,UuidUtil.getRandomCallsign());
+        passcode = prefs.getString(PREFS_PASSCODE,DEFAULT_PASSCODE);
+        //TODO replace this with a negotiated passcode
         SharedPreferences.Editor edit = prefs.edit();
         edit.putInt(PREFS_UUID,uuid);
         edit.putString(PREFS_UUID_EXTENDED,uuidExtended);
@@ -63,6 +87,7 @@ public class Config {
         SqAnDevice.remove(thisDevice); //dont list this device in the list of other devices
         thisDevice.setUuidExtended(uuidExtended);
         thisDevice.setCallsign(callsign);
+        loadVpnForwardingIps(context);
         String rawTeam = prefs.getString(PREFS_SAVED_TEAM,null);
         if (rawTeam != null) {
             try {
@@ -106,7 +131,74 @@ public class Config {
     public static boolean isWarnIncompleteEnabled() { return warnIncomplete; }
     public static void setWarnIncompleteEnabled(boolean enabled) { warnIncomplete = enabled; }
 
+    public static String getPasscode() { return passcode; }
+
     public static boolean isLoggingEnabled() { return writeLog; }
+
+    public static String getCallsign(Context context) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        return prefs.getString(PREFS_CALLSIGN,null);
+    }
+
+    public static ArrayList<VpnForwardValue> getStoredVpnForwarding(Context context) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        String values = prefs.getString(PREFS_VPN_FORWARDED_IPS,null);
+        ArrayList<VpnForwardValue> out = null;
+        if (values != null) {
+            try {
+                JSONArray array = new JSONArray(values);
+                for (int i=0;i<array.length();i++) {
+                    JSONObject obj = array.getJSONObject(i);
+                    int trueIp = obj.optInt("trueip",0);
+                    int forwaredAs = obj.optInt("fwdas",0);
+                    if (trueIp !=0 ) {
+                        if (out == null)
+                            out = new ArrayList<>();
+                        VpnForwardValue value = new VpnForwardValue((byte) (forwaredAs & 0xFF), trueIp);
+                        out.add(value);
+                        thisDevice.addVpnForwardValue(value);
+                    }
+                }
+            } catch (JSONException e) {
+                e.printStackTrace();
+            }
+        }
+        return out;
+    }
+
+    public static void loadVpnForwardingIps(Context context) {
+        if (thisDevice == null)
+            return;
+        ArrayList<VpnForwardValue> values = getStoredVpnForwarding(context);
+        if (values != null) {
+            for (VpnForwardValue value:values)
+                thisDevice.addVpnForwardValue(value);
+        }
+    }
+
+    public static void saveVpnForwardingIps(Context context, ArrayList<VpnForwardValue> values) {
+        if (values == null)
+            return;
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        SharedPreferences.Editor edit = prefs.edit();
+        if (values.isEmpty())
+            edit.remove(PREFS_VPN_FORWARDED_IPS);
+        else {
+            JSONArray array = new JSONArray();
+            for (VpnForwardValue value : values) {
+                try {
+                    JSONObject obj = new JSONObject();
+                    obj.put("trueip", value.getAddress());
+                    obj.put("fwdas", (int) value.getForwardIndex());
+                    array.put(obj);
+                } catch (JSONException e) {
+                    Log.d(TAG, "Unable to save VPN forwarding IPs: " + e.getMessage());
+                }
+            }
+            edit.putString(PREFS_VPN_FORWARDED_IPS, array.toString());
+        }
+        edit.apply();
+    }
 
     public static void recheckPreferences(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
@@ -115,14 +207,33 @@ public class Config {
         broadcastSa = prefs.getBoolean(PREFS_ALLOW_SA_BROADCAST,true);
         includeConnections = prefs.getBoolean(PREFS_DEBUG_MODE,true);
         vpnMode = prefs.getBoolean(PREFS_VPN_MODE,true);
+        vpnForward = prefs.getBoolean(PREFS_VPN_FORWARD, true);
+        vpnAutoAdd = prefs.getBoolean(PREFS_VPN_AUTO_ADD,true);
+        multicast = prefs.getBoolean(PREFS_VPN_MULTICAST,true);
         vpnLandingPage = prefs.getBoolean(PREFS_VPN_MODE,true);
         writeLog = prefs.getBoolean(PREFS_WRITE_LOG,true);
         warnIncomplete = prefs.getBoolean(PREFS_WARN_INCOMPLETE,true);
+        ignore0000 = prefs.getBoolean(PREFS_IGNORE_0_0_0_0,true);
+        silent = prefs.getBoolean(PREFS_SDR_LISTEN_ONLY,false);
+        largeDataWiFiOnly = prefs.getBoolean(PREFS_LARGE_DATA_WIFI_ONLY,true);
+        try {
+            mtuSize = Integer.parseInt(prefs.getString(PREFS_VPN_MTU, "1500"));
+        } catch (NumberFormatException e) {
+            mtuSize = 1500;
+        }
+        SdrConfig.init(context);
     }
 
     public static boolean isVpnEnabled() {
         return vpnMode;
     }
+
+    public static boolean isVpnForwardIps() {
+        //return vpnForward; //TODO uncomment this to enable VpnIpForwarding
+        return false; //TODO comment this out if the above line is uncommented
+    }
+
+    public static boolean isVpnAutoAdd() { return vpnAutoAdd; }
 
     public static boolean isVpnHostLandingPage() {
         return vpnLandingPage;
@@ -131,6 +242,7 @@ public class Config {
     public static void savePrefs(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
         SharedPreferences.Editor edit = prefs.edit();
+        SdrConfig.saveToPrefs(context);
         updateSavedTeammates();
         if (vpnMode)
             edit.putBoolean(PREFS_VPN_MODE,true);
@@ -155,7 +267,8 @@ public class Config {
                 if (device.getUUID() > 0) {
                     SavedTeammate teammate = getTeammate(device.getUUID());
                     if (teammate == null) {
-                        teammate = new SavedTeammate(device.getUUID(),device.getNetworkId());
+                        teammate = new SavedTeammate(device.getUUID());
+                        teammate.setNetID(device.getNetworkId());
                         teammate.setCallsign(device.getCallsign());
                         teammate.setBluetoothMac(device.getBluetoothMac());
                         teammate.setLastContact(device.getLastConnect());
@@ -310,6 +423,20 @@ public class Config {
         return null;
     }
 
+    public static SavedTeammate getTeammateByWiFiMac(MacAddress mac) {
+        if (mac != null) {
+            if (savedTeammates != null) {
+                synchronized (savedTeammates) {
+                    for (SavedTeammate teammate : savedTeammates) {
+                        if (mac.isEqual(teammate.getWiFiDirectMac()))
+                            return teammate;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     public static SavedTeammate getTeammate(String netID) {
         if (netID == null)
             return null;
@@ -349,8 +476,9 @@ public class Config {
         return null;
     }
 
-    public static SavedTeammate saveTeammate(int sqAnAddress, String netID, String callsign, MacAddress btMAC) {
-        SavedTeammate savedTeammate = new SavedTeammate(sqAnAddress, netID);
+    public static SavedTeammate saveTeammate(int sqAnAddress, String netId, String callsign, MacAddress btMAC) {
+        SavedTeammate savedTeammate = new SavedTeammate(sqAnAddress);
+        savedTeammate.setNetID(netId);
         savedTeammate.setCallsign(callsign);
         savedTeammate.setBluetoothMac(btMAC);
         return saveTeammate(savedTeammate);
@@ -382,5 +510,10 @@ public class Config {
     public static void setVpnEnabled(boolean b) {
         vpnMode = true;
     }
-
+    public static boolean isIgnoringPacketsTo0000() { return ignore0000; }
+    public static boolean isLargeDataWiFiOnly() { return largeDataWiFiOnly; }
+    public static boolean isMulticastEnabled() { return multicast; }
+    public static int getMtuSize() { return mtuSize; }
+    public static boolean isListenOnyMode() { return silent; }
+    //public static boolean portForwardingEnabled() { return true; /*TODO*/}
 }

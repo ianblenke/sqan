@@ -8,6 +8,7 @@ import org.sofwerx.sqan.Config;
 import org.sofwerx.sqan.ManetOps;
 import org.sofwerx.sqan.listeners.ManetListener;
 import org.sofwerx.sqan.manet.common.SqAnDevice;
+import org.sofwerx.sqan.manet.common.Status;
 import org.sofwerx.sqan.manet.common.packet.AbstractPacket;
 import org.sofwerx.sqan.manet.common.packet.DisconnectingPacket;
 import org.sofwerx.sqan.manet.common.packet.PacketHeader;
@@ -28,15 +29,14 @@ import java.nio.channels.SocketChannel;
 import java.util.Iterator;
 import java.util.Set;
 
-//FIXME establishing a connection with a client, then shutting down the app, then restarting the app leads to a problem with the port not being released and the server restart not fully taking
-
 /**
  * The Server to host Clients over TCP/IP
  */
 public class Server {
+    private final static String TAG = Config.TAG+".Server";
     private final static int MAX_SOCKETS_ACCEPTED = 24;
     private SocketChannelConfig config;
-    private boolean restart;
+    //private boolean restart;
     private Selector selector;
     private ServerSocketChannel server;
     private final PacketParser parser;
@@ -45,6 +45,8 @@ public class Server {
     private HandlerThread serverThread;
     private Handler handler;
     private final ManetListener manetListener;
+    private long lastConnection;
+    private long idleTimeout = -1l;
 
     public Server(SocketChannelConfig config, PacketParser parser, ServerStatusListener listener) {
         this.config = config;
@@ -54,7 +56,11 @@ public class Server {
             manetListener = parser.getManet().getListener();
         else
             manetListener = null;
-        Config.getThisDevice().setRoleWiFi(SqAnDevice.NodeRole.HUB);
+        //Config.getThisDevice().setRoleWiFi(SqAnDevice.NodeRole.HUB);
+    }
+
+    public int getActiveConnectionCount() {
+        return ClientHandler.getActiveConnectionCount();
     }
 
     private int acceptClients(int acceptCount) throws IOException {
@@ -85,6 +91,7 @@ public class Server {
      * @throws IOException
      */
     private void buildServer() throws IOException {
+        CommsLog.log(CommsLog.Entry.Category.CONNECTION,"Building WiFi server");
         final InetSocketAddress address = new InetSocketAddress(config.getPort());
         this.server = ServerSocketChannel.open();
         server.configureBlocking(false);
@@ -110,6 +117,11 @@ public class Server {
         // NOTE: the key for the server MUST have a null attachment
         server.register(selector, SelectionKey.OP_ACCEPT);
         CommsLog.log(CommsLog.Entry.Category.STATUS, "Server started port: " + address.getPort());
+        lastConnection = System.currentTimeMillis();
+    }
+
+    public boolean isRunning() {
+        return keepRunning && (serverThread != null) && serverThread.isAlive();
     }
 
     private void readAndProcess() throws IOException {
@@ -152,6 +164,22 @@ public class Server {
             }
 
             ClientHandler.removeUnresponsiveConnections();
+            if (idleTimeout > 0l) {
+                int clientCount = ClientHandler.getActiveConnectionCount();
+                if (clientCount > 0) {
+                    Log.d(TAG,"Server has "+clientCount+" active connection"+((clientCount==1)?"":"s"));
+                    lastConnection = System.currentTimeMillis();
+                } else {
+                    if (lastConnection > 0l) {
+                        Log.d(TAG,"Server has no active connections");
+                        long elapsed = System.currentTimeMillis() - lastConnection;
+                        if (elapsed > idleTimeout) {
+                            Log.d(TAG, "Server has had no connections for " + Long.toString(elapsed)+"ms; shutting down");
+                            close(false);
+                        }
+                    }
+                }
+            }
 
             // Make sure the operations are set correctly
             int connectionCount = selector.keys().size();
@@ -176,44 +204,23 @@ public class Server {
     }
 
     public void start() {
-        serverThread = new HandlerThread("WiFiServer") {
+        Log.d(TAG,"IP server start()");
+        serverThread = new HandlerThread("IpServer") {
             @Override
             protected void onLooperPrepared() {
                 handler = new Handler(serverThread.getLooper());
                 keepRunning = true;
-                restart = true;
-                //while (keepRunning) {
-                    try {
-                        buildServer();
-                        readAndProcess();
-                    } catch (Throwable t) {
-                /*        if (restart) {
-                            CommsLog.log(CommsLog.Entry.Category.STATUS, "Could not start server; shutting server down...");
-                            Log.w(Config.TAG, t.getMessage());
-                            restart = false;
-                            try {
-                                if (selector != null) {
-                                    selector.close();
-                                    selector = null;
-                                }
-                            } catch (IOException ignore) {
-                            }
-                            try {
-                                server.close();
-                                server = null;
-                            } catch (IOException ignore) {
-                            }
-                        } else {
-                *///            keepRunning = false;
-                            CommsLog.log(CommsLog.Entry.Category.PROBLEM, "Severe processing error while running in Server mode");
-                            if (listener == null)
-                                close(false);
-                            else
-                                listener.onServerFatalError();
-                //            break;
-                //        }
-                    }
-                //}
+                //restart = true;
+                try {
+                    buildServer();
+                    readAndProcess();
+                } catch (Throwable t) {
+                    CommsLog.log(CommsLog.Entry.Category.PROBLEM, "Severe processing error while running in Server mode");
+                    if (listener == null)
+                        close(false);
+                    else
+                        listener.onServerFatalError();
+                }
             }
         };
         serverThread.start();
@@ -223,78 +230,94 @@ public class Server {
      * Send a packet to a specific client (or all clients)
      * @param packet
      * @param address the client SqAnAddress (or PacketHeader.BROADCAST_ADDRESS for all clients)
+     * @return true == the server is trying to send this packet
      */
-    public void burst(AbstractPacket packet, int address) {
+    public boolean burst(AbstractPacket packet, int address) {
         if (handler == null) {
-            Log.d(Config.TAG, "Burst requested, but Handler is not ready yet");
-            return;
+            Log.d(TAG, "Burst requested, but Handler is not ready yet");
+            return false;
         }
+        boolean sent = false;
         if (packet != null) {
             byte[] bytes = packet.toByteArray();
-            CommsLog.log(CommsLog.Entry.Category.COMMS,"Server bursting "+bytes.length+"b packet to "+address);
+            if (address == PacketHeader.BROADCAST_ADDRESS)
+                Log.d(TAG,"Server broadcasting "+bytes.length+"b packet");
+            else
+                Log.d(TAG,"Server bursting "+bytes.length+"b packet to "+address);
             ByteBuffer out = ByteBuffer.allocate(4 + bytes.length);
             out.putInt(bytes.length);
             out.put(bytes);
-            ClientHandler.addToWriteQue(out,address);
-            if (manetListener != null)
-                manetListener.onTx(packet);
-            ManetOps.addBytesToTransmittedTally(bytes.length);
+            sent = ClientHandler.addToWriteQue(out,address);
+            if (sent) {
+                if (manetListener != null)
+                    manetListener.onTx(packet);
+                ManetOps.addBytesToTransmittedTally(bytes.length);
+            }
         }
+        return sent;
     }
 
     public void close(final boolean announce) {
+        keepRunning = false;
         Config.getThisDevice().setRoleWiFi(SqAnDevice.NodeRole.OFF);
         if (handler != null) {
-            handler.removeCallbacks(null);
+            //handler.removeCallbacks(null);
             handler.post(() -> {
                 if (announce)
                     burst(new DisconnectingPacket(Config.getThisDevice().getUUID()), PacketHeader.BROADCAST_ADDRESS);
-                Log.d(Config.TAG, "Server shutting down...");
-                keepRunning = false;
+                Log.d(TAG, "Server shutting down...");
+                handler.removeCallbacksAndMessages(null);
+                handler = null;
                 if (selector != null) {
                     try {
                         selector.close();
-                        Log.d(Config.TAG, "Server selector.close() complete");
+                        Log.d(TAG, "Server selector.close() complete");
                     } catch (IOException e) {
-                        Log.e(Config.TAG, "Server selector.close() error: " + e.getMessage());
+                        Log.e(TAG, "Server selector.close() error: " + e.getMessage());
                     }
                 }
                 if (server != null) {
                     try {
                         server.close();
-                        Log.d(Config.TAG, "Server server.close() complete");
+                        Log.d(TAG, "Server server.close() complete");
                     } catch (IOException e) {
-                        Log.e(Config.TAG, "Server server.close() error: " + e.getMessage());
+                        Log.e(TAG, "Server server.close() error: " + e.getMessage());
                     }
                 }
                 if (serverThread != null)
                     serverThread.quitSafely();
-                if (listener != null)
-                    listener.onServerClosed();
             });
         } else {
             keepRunning = false;
-            Log.d(Config.TAG, "Handler is null but Server shutting down anyway...");
+            Log.d(TAG, "Handler is null but Server shutting down anyway...");
             if (selector != null) {
                 try {
                     selector.close();
-                    Log.d(Config.TAG, "Handler is null but Server selector.close() complete");
+                    Log.d(TAG, "Handler is null but Server selector.close() complete");
                 } catch (IOException e) {
-                    Log.e(Config.TAG, "Handler is null and Server selector.close() error: " + e.getMessage());
+                    Log.e(TAG, "Handler is null and Server selector.close() error: " + e.getMessage());
                 }
             }
             if (server != null) {
                 try {
                     server.close();
-                    Log.d(Config.TAG, "Handler is null but Server server.close() complete");
+                    Log.d(TAG, "Handler is null but Server server.close() complete");
                 } catch (IOException e) {
-                    Log.e(Config.TAG, "Handler is null and Server server.close() error: " + e.getMessage());
+                    Log.e(TAG, "Handler is null and Server server.close() error: " + e.getMessage());
                 }
             }
             if (serverThread != null)
                 serverThread.quit();
-            if (listener != null)
-                listener.onServerClosed();
         }
+        ClientHandler.clear();
+        if (listener != null)
+            listener.onServerClosed();
     }
+
+    /**
+     * Server will shutdown if it doesn't have
+     * @param idleLength time in ms (negative == no timeout)
+     */
+    public void setIdleTimeout(long idleLength) { this.idleTimeout = idleLength; }
+    public void clearIdleTimeout() { idleTimeout = -1l; }
 }
